@@ -183,7 +183,7 @@ FROM requests WHERE id = ?`, id)
 }
 
 func scanRows(rows *sql.Rows) ([]RequestRow, error) {
-	var out []RequestRow
+	out := make([]RequestRow, 0)
 	for rows.Next() {
 		var r RequestRow
 		var ts int64
@@ -233,10 +233,10 @@ FROM requests WHERE ts >= ?`, cutoff)
 
 // HourPoint is one bucket in a time series.
 type HourPoint struct {
-	Hour        int64 `json:"hour"`
-	Requests    int64 `json:"requests"`
-	Errors      int64 `json:"errors"`
-	InputTokens int64 `json:"input_tokens"`
+	Hour         int64 `json:"hour"`
+	Requests     int64 `json:"requests"`
+	Errors       int64 `json:"errors"`
+	InputTokens  int64 `json:"input_tokens"`
 	OutputTokens int64 `json:"output_tokens"`
 }
 
@@ -253,7 +253,7 @@ FROM stats_hourly WHERE hour >= ? ORDER BY hour ASC`, from)
 		return nil, err
 	}
 	defer rows.Close()
-	var out []HourPoint
+	out := make([]HourPoint, 0)
 	for rows.Next() {
 		var p HourPoint
 		if err := rows.Scan(&p.Hour, &p.Requests, &p.Errors, &p.InputTokens, &p.OutputTokens); err != nil {
@@ -280,7 +280,7 @@ FROM requests WHERE ts >= ? GROUP BY target_model ORDER BY req_count DESC`, sinc
 		return nil, err
 	}
 	defer rows.Close()
-	var out []ModelUsagePoint
+	out := make([]ModelUsagePoint, 0)
 	for rows.Next() {
 		var p ModelUsagePoint
 		if err := rows.Scan(&p.Model, &p.Requests, &p.Tokens); err != nil {

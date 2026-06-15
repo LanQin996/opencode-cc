@@ -78,16 +78,21 @@ async function asJson<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
 }
 
+async function asArray<T>(res: Response): Promise<T[]> {
+  const value = await asJson<unknown>(res);
+  return Array.isArray(value) ? (value as T[]) : [];
+}
+
 export const api = {
   health: () => fetch("/api/health").then((r) => asJson<{ ok: boolean }>(r)),
   summary: () => fetch("/api/stats/summary").then((r) => asJson<Summary>(r)),
   hourly: (hours = 24) =>
-    fetch(`/api/stats/hourly?hours=${hours}`).then((r) => asJson<HourPoint[]>(r)),
+    fetch(`/api/stats/hourly?hours=${hours}`).then((r) => asArray<HourPoint>(r)),
   models: (hours = 24) =>
-    fetch(`/api/stats/models?hours=${hours}`).then((r) => asJson<ModelUsagePoint[]>(r)),
+    fetch(`/api/stats/models?hours=${hours}`).then((r) => asArray<ModelUsagePoint>(r)),
   latency: () => fetch("/api/stats/latency").then((r) => asJson<Latency>(r)),
   logs: (limit = 100) =>
-    fetch(`/api/logs?limit=${limit}`).then((r) => asJson<LogRow[]>(r)),
+    fetch(`/api/logs?limit=${limit}`).then((r) => asArray<LogRow>(r)),
   log: (id: number) => fetch(`/api/logs/${id}`).then((r) => asJson<LogRow>(r)),
   getConfig: () => fetch("/api/config").then((r) => asJson<PanelConfig>(r)),
   putConfig: (body: unknown) =>

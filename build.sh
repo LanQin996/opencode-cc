@@ -14,8 +14,8 @@ echo "[1/4] Building web panel..."
 )
 
 echo "[2/4] Copying dist into embed folder..."
-rm -rf internal/assets/dist
 mkdir -p internal/assets/dist
+find internal/assets/dist -mindepth 1 -maxdepth 1 ! -name .gitkeep -exec rm -rf {} +
 cp -r web/dist/. internal/assets/dist/
 
 echo "[3/4] Compiling Go binary..."

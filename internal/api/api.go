@@ -94,7 +94,7 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
 		"time":    time.Now().Format(time.RFC3339),
-		"version": "1.0.0",
+		"version": "1.0.1",
 	})
 }
 

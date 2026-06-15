@@ -1,6 +1,6 @@
-// Package assets serves the built web panel (a static SPA). It prefers an
-// on-disk web/dist (so the frontend can be iterated without recompiling Go),
-// then falls back to assets embedded at build time, then a placeholder page.
+// Package assets serves the built web panel (a static SPA). Embedded assets
+// are used by default. An external directory can be selected explicitly with
+// OPENCODE_CC_WEB_DIR for development.
 package assets
 
 import (
@@ -16,16 +16,27 @@ import (
 //go:embed all:dist
 var embedded embed.FS
 
-// FileSystem returns an http.FileSystem for the panel SPA. It prefers the
-// on-disk web/dist (useful when running the Go binary during frontend
-// development), then the embedded build.
+// FileSystem returns an http.FileSystem for the panel SPA. It does not
+// automatically use web/dist: a stale or partially-built directory beside the
+// binary must not shadow the complete embedded panel.
 func FileSystem() (http.FileSystem, bool) {
-	if _, err := os.Stat("web/dist/index.html"); err == nil {
-		return http.Dir("web/dist"), true
+	if dir := os.Getenv("OPENCODE_CC_WEB_DIR"); dir != "" {
+		if panelFS, ok := panelFileSystem(os.DirFS(dir)); ok {
+			return panelFS, true
+		}
 	}
+
 	sub, err := fs.Sub(embedded, "dist")
 	if err != nil {
 		return nil, false
 	}
-	return http.FS(sub), true
+	return panelFileSystem(sub)
+}
+
+func panelFileSystem(root fs.FS) (http.FileSystem, bool) {
+	info, err := fs.Stat(root, "index.html")
+	if err != nil || info.IsDir() {
+		return nil, false
+	}
+	return http.FS(root), true
 }

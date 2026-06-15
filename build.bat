@@ -15,9 +15,10 @@ if errorlevel 1 ( echo vite build failed & popd & exit /b 1 )
 popd
 
 echo [2/4] Copying dist into embed folder...
-REM Keep the embed folder (and its .gitkeep) but clear built assets first.
-del /q "internal\assets\dist\*" 2>nul
-if exist "internal\assets\dist\assets" rmdir /s /q "internal\assets\dist\assets" 2>nul
+REM Keep the embed folder and its tracked .gitkeep, but clear built assets.
+if not exist "internal\assets\dist" mkdir "internal\assets\dist"
+for %%F in ("internal\assets\dist\*") do if /i not "%%~nxF"==".gitkeep" del /q "%%F" 2>nul
+for /d %%D in ("internal\assets\dist\*") do rmdir /s /q "%%D" 2>nul
 xcopy web\dist\* internal\assets\dist\ /e /i /y /q | findstr /v "File(s)" >nul
 
 echo [3/4] Compiling Go binary...

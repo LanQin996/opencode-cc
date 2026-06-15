@@ -1,5 +1,7 @@
 # opencode-cc
 
+[简体中文](README.md) | [English](README_EN.md)
+
 > Anthropic → OpenCode Zen 多协议桥接代理，附带嵌入式 Web 控制面板。
 
 `opencode-cc` 是一个高性能 Go 代理，对外暴露 **Anthropic Messages API**
