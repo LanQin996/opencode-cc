@@ -17,6 +17,9 @@
                                           SQLite（纯 Go，无 CGO）
 ```
 
+<img width="2545" height="1191" alt="QQ_1781500954802" src="https://github.com/user-attachments/assets/1aadd46f-5fe9-4812-a89f-42e4ef635487" />
+
+
 ## 4 种协议自动路由
 
 Zen 不是单一 OpenAI 兼容端点——按模型来源分成 4 条路径。代理根据 model id 前缀自动选择：
