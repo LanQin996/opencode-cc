@@ -21,8 +21,8 @@ type sseMessageStartData struct {
 
 // streamMessageStart is the full {"type":"message_start","message":{...}}.
 type streamMessageStart struct {
-	Type    string         `json:"type"`
-	Message streamMessage  `json:"message"`
+	Type    string        `json:"type"`
+	Message streamMessage `json:"message"`
 }
 
 type streamMessage struct {
@@ -45,11 +45,11 @@ type streamContentBlockStart struct {
 // streamContentRef is the minimal block description sent on block start. For
 // tool_use we send {type,id,name,input:{}}; the body comes via input_json_delta.
 type streamContentRef struct {
-	Type  string          `json:"type"`
-	Text  string          `json:"text,omitempty"`
-	ID    string          `json:"id,omitempty"`
-	Name  string          `json:"name,omitempty"`
-	Input jsonRawMessage  `json:"input,omitempty"`
+	Type  string         `json:"type"`
+	Text  string         `json:"text,omitempty"`
+	ID    string         `json:"id,omitempty"`
+	Name  string         `json:"name,omitempty"`
+	Input jsonRawMessage `json:"input,omitempty"`
 }
 
 type streamContentBlockDelta struct {
@@ -104,9 +104,9 @@ type streamErrorEvent struct {
 // blockState tracks one in-progress content block so we can emit
 // content_block_stop when it changes or ends.
 type blockState struct {
-	index    int
-	kind     string // "text" | "tool_use"
-	toolid   string
+	index  int
+	kind   string // "text" | "tool_use"
+	toolid string
 }
 
 // StreamConverter maintains state while translating an OpenAI SSE stream into
@@ -116,10 +116,13 @@ type StreamConverter struct {
 	model   string
 	stopSeq *string
 
-	cur  *blockState
-	nextIdx int
-	input  int // input tokens (from final usage chunk, if upstream sends one)
-	output int // output tokens tally (from final usage chunk)
+	cur              *blockState
+	nextIdx          int
+	input            int // input tokens (from final usage chunk, if upstream sends one)
+	output           int // output tokens tally (from final usage chunk)
+	restrictTools    bool
+	allowedTools     map[string]struct{}
+	acceptedToolCall bool
 
 	// OpenAI streams send finish_reason on the last content chunk and usage in
 	// a trailing empty-choices chunk. We remember the finish reason and emit
@@ -145,6 +148,19 @@ func NewStreamConverter(w io.Writer, model string, stopSeq *string) (*StreamConv
 		return nil, err
 	}
 	return c, nil
+}
+
+// RestrictTools limits emitted tool_use blocks to names declared by the
+// incoming Anthropic request. Passing an empty slice rejects every upstream
+// tool call, which prevents clients from trying to execute hallucinated tools.
+func (c *StreamConverter) RestrictTools(names []string) {
+	c.restrictTools = true
+	c.allowedTools = make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if name != "" {
+			c.allowedTools[name] = struct{}{}
+		}
+	}
 }
 
 func (c *StreamConverter) emitMessageStart() error {
@@ -194,6 +210,9 @@ func (c *StreamConverter) HandleChunk(chunk *OpenAIStreamChunk) error {
 		// and pollute tool-call parsing, yielding empty/broken replies.
 		// 2. Tool call deltas.
 		for _, tc := range ch.Delta.ToolCalls {
+			if !c.toolAllowed(tc.Function.Name) {
+				continue
+			}
 			if err := c.handleToolCall(tc); err != nil {
 				return err
 			}
@@ -221,8 +240,8 @@ func (c *StreamConverter) handleText(text string) error {
 		c.nextIdx++
 		c.cur = &blockState{index: idx, kind: "text"}
 		if err := c.writeEvent("content_block_start", streamContentBlockStart{
-			Type:  "content_block_start",
-			Index: idx,
+			Type:         "content_block_start",
+			Index:        idx,
 			ContentBlock: streamContentRef{Type: "text", Text: ""},
 		}); err != nil {
 			return err
@@ -264,6 +283,7 @@ func (c *StreamConverter) handleToolCall(tc OpenAIToolCall) error {
 			idx := c.nextIdx
 			c.nextIdx++
 			c.cur = &blockState{index: idx, kind: "tool_use", toolid: rawID}
+			c.acceptedToolCall = true
 			if err := c.writeEvent("content_block_start", streamContentBlockStart{
 				Type:  "content_block_start",
 				Index: idx,
@@ -291,6 +311,19 @@ func (c *StreamConverter) handleToolCall(tc OpenAIToolCall) error {
 		}
 	}
 	return nil
+}
+
+func (c *StreamConverter) toolAllowed(name string) bool {
+	if !c.restrictTools {
+		return true
+	}
+	if name == "" {
+		// Empty names are continuation deltas and are only valid while an
+		// accepted tool block is already open.
+		return c.cur != nil && c.cur.kind == "tool_use"
+	}
+	_, ok := c.allowedTools[name]
+	return ok
 }
 
 // closeCurrent emits content_block_stop for the active block, if any.
@@ -322,6 +355,9 @@ func (c *StreamConverter) Finalize(stopReason string) error {
 	// stopReason (e.g. "stream_error").
 	reason := c.pendingFinish
 	if reason == "" {
+		reason = "stop"
+	}
+	if (reason == "tool_calls" || reason == "function_call") && !c.acceptedToolCall {
 		reason = "stop"
 	}
 	stop := mapFinishReason(reason)

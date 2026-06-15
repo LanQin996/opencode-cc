@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -62,6 +63,42 @@ func TestClientAuthAcceptsValidKey(t *testing.T) {
 	}
 	if authenticated == nil || authenticated.Name != "test" {
 		t.Fatalf("authenticated key = %+v", authenticated)
+	}
+}
+
+func TestClientAuthUsesOpenAIErrorForChatCompletions(t *testing.T) {
+	cfg := config.Default()
+	cfg.RequireAPIKey = true
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	New(cfg, st).clientAuth(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("protected handler was called")
+	})).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.Error.Type != "authentication_error" || body.Error.Message == "" {
+		t.Fatalf("unexpected OpenAI error: %s", rec.Body.String())
+	}
+	if body.Type != "" {
+		t.Fatalf("received Anthropic error shape: %s", rec.Body.String())
 	}
 }
 

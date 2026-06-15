@@ -44,6 +44,9 @@ func (s *Server) Handler(panelAssets http.FileSystem, panelMux http.Handler) htt
 	// ---- Anthropic-compatible endpoints (gated by client API key) ----
 	mux.Handle("/v1/messages", s.clientAuth(s.Proxy()))
 	mux.Handle("/v1/messages/count_tokens", s.clientAuth(s.CountTokens()))
+	// OpenAI-compatible clients can use the same server directly. Requests are
+	// forwarded to Zen after applying the configured model mapping.
+	mux.Handle("/v1/chat/completions", s.clientAuth(s.OpenAIProxy()))
 	mux.Handle("/v1/models", s.clientAuth(proxy.ModelsHandler(
 		s.httpClient,
 		func() string { return s.cfg.Snapshot().UpstreamBase },

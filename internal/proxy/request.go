@@ -16,12 +16,12 @@ import (
 // resolveModel is called to map the incoming model name to an upstream target.
 func ConvertRequest(in *AnthropicRequest, resolveModel func(string) string) *OpenAIRequest {
 	out := &OpenAIRequest{
-		Model:    resolveModel(in.Model),
-		Stream:   in.Stream,
-		Stop:     in.Stop,
-		MaxTokens: &in.MaxTokens,
+		Model:       resolveModel(in.Model),
+		Stream:      in.Stream,
+		Stop:        in.Stop,
+		MaxTokens:   &in.MaxTokens,
 		Temperature: in.Temperature,
-		TopP:     in.TopP,
+		TopP:        in.TopP,
 	}
 
 	// System prompt first, if present.
@@ -46,25 +46,34 @@ func ConvertRequest(in *AnthropicRequest, resolveModel func(string) string) *Ope
 				},
 			})
 		}
+	} else {
+		// Be explicit for models that may hallucinate tool calls even when the
+		// client did not declare any tools. A tool_use block for an undeclared
+		// name makes clients enter a repeated "tool not found" loop.
+		out.ToolChoice = "none"
 	}
 
 	// Tool choice. Anthropic shapes: {"type":"auto"|"any"|"tool","name":...}.
-	switch in.ToolChoice.Type {
-	case "auto":
-		out.ToolChoice = "auto"
-	case "any":
-		out.ToolChoice = "required"
-	case "tool":
-		if in.ToolChoice.Name != "" {
-			out.ToolChoice = map[string]any{
-				"type": "function",
-				"function": map[string]string{"name": in.ToolChoice.Name},
-			}
-		} else {
+	// Ignore tool_choice when there are no declarations: "none" must remain in
+	// force or an inconsistent client request can re-enable hallucinated calls.
+	if len(in.Tools) > 0 {
+		switch in.ToolChoice.Type {
+		case "auto":
 			out.ToolChoice = "auto"
+		case "any":
+			out.ToolChoice = "required"
+		case "tool":
+			if in.ToolChoice.Name != "" {
+				out.ToolChoice = map[string]any{
+					"type":     "function",
+					"function": map[string]string{"name": in.ToolChoice.Name},
+				}
+			} else {
+				out.ToolChoice = "auto"
+			}
+		case "none":
+			out.ToolChoice = "none"
 		}
-	case "none":
-		out.ToolChoice = "none"
 	}
 
 	// Ask for usage in the final streamed chunk.

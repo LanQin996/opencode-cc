@@ -2,10 +2,10 @@
 
 [简体中文](README.md) | [English](README_EN.md)
 
-> An Anthropic-to-OpenCode Zen multi-protocol bridge proxy with an embedded web dashboard.
+> An Anthropic/OpenAI-to-OpenCode Zen multi-protocol bridge proxy with an embedded web dashboard.
 
-`opencode-cc` is a high-performance Go proxy that exposes the **Anthropic Messages API**
-(`POST /v1/messages`, with both streaming and non-streaming support) and translates it into the native protocols of the
+`opencode-cc` is a high-performance Go proxy that exposes both the **Anthropic Messages API** and the
+**OpenAI Chat Completions API**, with streaming and non-streaming support, and forwards requests to the
 **[OpenCode Zen](https://opencode.ai/docs/zen/)** gateway. Zen provides 49 models across four protocols. The proxy
 automatically selects the correct protocol translator based on the target model ID, allowing Claude Code to run
 transparently with GLM, Kimi, DeepSeek, Qwen, Claude, GPT, Gemini, and other models.
@@ -46,6 +46,9 @@ Each protocol implements the `TranslateRequest`, `TranslateResponse`, and `Trans
 - **Automatic routing across four protocols.** Model IDs beginning with `claude-` or `qwen` use Anthropic,
   `gpt-` uses Responses, `gemini-` uses Google, and all other models use OpenAI. No manual protocol configuration is
   required.
+- **OpenAI client compatibility.** Supports `POST /v1/chat/completions` and an OpenAI-compatible `/v1/models`
+  response, allowing OpenAI SDKs and compatible desktop clients to connect directly. The OpenAI path passes through
+  Zen's native `/go/v1/chat/completions` JSON/SSE response without converting it to Anthropic format.
 - **A built-in catalog of 49 models.** The Models page displays pricing, context limits, capability tags, and protocol
   badges. Models can be added to mappings directly from the Config page.
 - **A single static binary.** The React SPA is embedded with `embed.FS`, so Node.js is not required at runtime.
@@ -91,6 +94,23 @@ Then point Claude Code at the proxy:
 export ANTHROPIC_BASE_URL=http://localhost:8787
 export ANTHROPIC_AUTH_TOKEN=local    # Any value works when proxy auth is disabled
 claude
+```
+
+For the OpenAI SDK or compatible clients, set the base URL to `http://localhost:8787/v1`:
+
+> Select **OpenAI** as the client's API type. A request path of `/v1/messages` means the client is still using
+> Anthropic mode, where responses are translated to the Anthropic Messages protocol instead of passed through natively.
+
+```bash
+export OPENAI_BASE_URL=http://localhost:8787/v1
+export OPENAI_API_KEY=local          # Use a key created in the panel when client authentication is enabled
+```
+
+```bash
+curl http://localhost:8787/v1/chat/completions \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.1","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
 ### Development Mode with HMR
@@ -177,12 +197,14 @@ unchanged.
 
 ## API Endpoints
 
-### Anthropic-Compatible API for Claude Code
+### Model Proxy APIs
 
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/v1/messages` | `stream:true` returns SSE; `stream:false` returns JSON |
 | POST | `/v1/messages/count_tokens` | Best-effort token estimation |
+| POST | `/v1/chat/completions` | OpenAI Chat Completions with streaming and non-streaming support |
+| GET | `/v1/models` | Model list compatible with both OpenAI and Anthropic clients |
 | GET | `/healthz` | Liveness probe |
 
 ### Dashboard API

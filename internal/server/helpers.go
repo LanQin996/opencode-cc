@@ -24,3 +24,17 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, msg string)
 		"error": map[string]string{"type": errType, "message": msg},
 	})
 }
+
+// writeOpenAIError writes an OpenAI-compatible error response.
+func writeOpenAIError(w http.ResponseWriter, status int, errType, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    errType,
+			"param":   nil,
+			"code":    nil,
+		},
+	})
+}

@@ -11,15 +11,19 @@ type AnthropicModelInfo struct {
 	ID          string `json:"id"`
 	DisplayName string `json:"display_name"`
 	Type        string `json:"type"`
+	Object      string `json:"object"`
 	CreatedAt   int64  `json:"created_at,omitempty"`
+	Created     int64  `json:"created,omitempty"`
+	OwnedBy     string `json:"owned_by,omitempty"`
 }
 
 // AnthropicModelList is the body of GET /v1/models.
 type AnthropicModelList struct {
 	Data    []AnthropicModelInfo `json:"data"`
+	Object  string               `json:"object"`
 	FirstID string               `json:"first_id,omitempty"`
-	LastID  string `json:"last_id,omitempty"`
-	HasMore bool   `json:"has_more"`
+	LastID  string               `json:"last_id,omitempty"`
+	HasMore bool                 `json:"has_more"`
 }
 
 // fetchZenModels queries the upstream <base>/v1/models and returns the ids. It
@@ -56,7 +60,10 @@ func fetchZenModels(client *http.Client, base, apiKey string) ([]AnthropicModelI
 		out = append(out, AnthropicModelInfo{
 			ID:        m.ID,
 			Type:      "model",
+			Object:    "model",
 			CreatedAt: m.Created,
+			Created:   m.Created,
+			OwnedBy:   "opencode-zen",
 		})
 	}
 	return out, nil
@@ -73,7 +80,7 @@ func ModelsHandler(client *http.Client, upstreamBase, apiKey func() string) http
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Serve from cache if fresh (< 60s).
 		if len(cache) > 0 && time.Since(cachedAt) < time.Minute {
-			list := AnthropicModelList{Data: cache, HasMore: false}
+			list := AnthropicModelList{Data: cache, Object: "list", HasMore: false}
 			writeJSON(w, http.StatusOK, list)
 			return
 		}
@@ -87,9 +94,13 @@ func ModelsHandler(client *http.Client, upstreamBase, apiKey func() string) http
 		}
 		if len(cache) == 0 {
 			// Minimal fallback so the endpoint never errors.
-			cache = []AnthropicModelInfo{{ID: "glm-5.1", Type: "model"}}
+			cache = []AnthropicModelInfo{{
+				ID: "glm-5.1", Type: "model", Object: "model", OwnedBy: "opencode-zen",
+			}}
 		}
-		writeJSON(w, http.StatusOK, AnthropicModelList{Data: cache, HasMore: false})
+		writeJSON(w, http.StatusOK, AnthropicModelList{
+			Data: cache, Object: "list", HasMore: false,
+		})
 	}
 }
 

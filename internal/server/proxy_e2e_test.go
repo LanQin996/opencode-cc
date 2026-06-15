@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Kiowx/opencode-cc/internal/config"
+	"github.com/Kiowx/opencode-cc/internal/proxy"
 	"github.com/Kiowx/opencode-cc/internal/store"
 )
 
@@ -219,6 +220,63 @@ func TestProxyMissingKey(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "no Zen API key") {
 		t.Errorf("unexpected error body: %s", rr.Body.String())
+	}
+}
+
+func TestProxyNonStreamFiltersUndeclaredToolCall(t *testing.T) {
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var upstreamReq map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if upstreamReq["tool_choice"] != "none" {
+			t.Errorf("tool_choice = %v, want none", upstreamReq["tool_choice"])
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-rogue",
+			"choices": []map[string]any{{
+				"index": 0,
+				"message": map[string]any{
+					"role": "assistant",
+					"tool_calls": []map[string]any{{
+						"id":   "call_missing",
+						"type": "function",
+						"function": map[string]any{
+							"name":      "undeclared_tool",
+							"arguments": `{}`,
+						},
+					}},
+				},
+				"finish_reason": "tool_calls",
+			}},
+			"usage": map[string]any{},
+		})
+	}))
+	defer zen.Close()
+	srv, _ := newTestServer(t, zen.URL)
+
+	body := []byte(`{
+		"model":"deepseek-v4-flash",
+		"max_tokens":256,
+		"messages":[{"role":"user","content":"hello"}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Proxy().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp proxy.AnthropicResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	for _, block := range resp.Content {
+		if block.Type == "tool_use" {
+			t.Fatalf("undeclared tool call leaked: %+v", block)
+		}
+	}
+	if resp.StopReason == nil || *resp.StopReason != "end_turn" {
+		t.Fatalf("stop_reason = %v, want end_turn", resp.StopReason)
 	}
 }
 

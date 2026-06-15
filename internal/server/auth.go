@@ -58,7 +58,7 @@ func InvalidateKeyCache() {
 //   - If the key has an IP allowlist, the client IP must match (CIDR supported).
 //   - Quota checks: token_quota / request_quota (lifetime) and daily_*_limit.
 //
-// On rejection it writes an Anthropic-shaped error.
+// On rejection it writes an error matching the requested API protocol.
 func (s *Server) clientAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Fast path: auth disabled.
@@ -73,29 +73,29 @@ func (s *Server) clientAuth(next http.Handler) http.Handler {
 			plain = strings.TrimSpace(r.Header.Get("x-api-key"))
 		}
 		if plain == "" {
-			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error",
-				"missing API key. Set ANTHROPIC_AUTH_TOKEN to a key from the panel.")
+			writeClientAPIError(w, r, http.StatusUnauthorized, "authentication_error",
+				"missing API key. Send a key from the panel as Authorization: Bearer <key> or x-api-key.")
 			return
 		}
 
 		hash := store.HashKey(plain)
 		k := s.lookupKeyCached(r.Context(), hash)
 		if k == nil {
-			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "invalid API key")
+			writeClientAPIError(w, r, http.StatusUnauthorized, "authentication_error", "invalid API key")
 			return
 		}
 		if !k.Enabled {
-			writeAnthropicError(w, http.StatusForbidden, "authentication_error", "this API key is disabled")
+			writeClientAPIError(w, r, http.StatusForbidden, "authentication_error", "this API key is disabled")
 			return
 		}
 		if k.ExpiresAt > 0 && time.Now().Unix() > k.ExpiresAt {
-			writeAnthropicError(w, http.StatusForbidden, "authentication_error", "this API key has expired")
+			writeClientAPIError(w, r, http.StatusForbidden, "authentication_error", "this API key has expired")
 			return
 		}
 
 		// IP allowlist.
 		if k.AllowedIPs != "" && !ipAllowed(r, k.AllowedIPs) {
-			writeAnthropicError(w, http.StatusForbidden, "authentication_error",
+			writeClientAPIError(w, r, http.StatusForbidden, "authentication_error",
 				"client IP is not allowed for this API key")
 			return
 		}
@@ -107,12 +107,20 @@ func (s *Server) clientAuth(next http.Handler) http.Handler {
 		}
 		if reason := quotaBlocked(k); reason != "" {
 			w.Header().Set("Retry-After", "60")
-			writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_error", reason)
+			writeClientAPIError(w, r, http.StatusTooManyRequests, "rate_limit_error", reason)
 			return
 		}
 
 		next.ServeHTTP(w, r.WithContext(withAPIKey(r.Context(), k)))
 	})
+}
+
+func writeClientAPIError(w http.ResponseWriter, r *http.Request, status int, errType, msg string) {
+	if r != nil && r.URL.Path == "/v1/chat/completions" {
+		writeOpenAIError(w, status, errType, msg)
+		return
+	}
+	writeAnthropicError(w, status, errType, msg)
 }
 
 // lookupKeyCached returns the key for hash, using a short-lived cache for the

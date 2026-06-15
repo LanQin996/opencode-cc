@@ -83,12 +83,50 @@ func TestStreamConversion(t *testing.T) {
 	}
 }
 
+func TestStreamConversionRejectsUndeclaredToolCalls(t *testing.T) {
+	var out bytes.Buffer
+	conv, err := NewStreamConverter(&out, "test-model", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.RestrictTools(nil)
+
+	finish := "tool_calls"
+	if err := conv.HandleChunk(&OpenAIStreamChunk{Choices: []OpenAIChoice{{
+		Delta: OpenAIDelta{ToolCalls: []OpenAIToolCall{{
+			ID:   "call_missing",
+			Type: "function",
+			Function: OpenAIFunctionCall{
+				Name:      "undeclared_tool",
+				Arguments: `{"value":1}`,
+			},
+		}}},
+		FinishReason: &finish,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.Finalize("end_turn"); err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := out.String()
+	if strings.Contains(got, "tool_use") || strings.Contains(got, "undeclared_tool") {
+		t.Fatalf("undeclared tool leaked into Anthropic stream:\n%s", got)
+	}
+	if !strings.Contains(got, `"stop_reason":"end_turn"`) {
+		t.Fatalf("stop reason was not normalized:\n%s", got)
+	}
+}
+
 // TestNonStreamConversion checks the non-streaming path end to end.
 func TestNonStreamConversion(t *testing.T) {
 	up := &OpenAIResponse{
 		ID: "chatcmpl-abc",
 		Choices: []OpenAIChoice{{
-			Message: &OpenAIMessage{Role: "assistant", Content: "Hi there"},
+			Message:      &OpenAIMessage{Role: "assistant", Content: "Hi there"},
 			FinishReason: strPtr("stop"),
 		}},
 		Usage: OpenAIUsage{PromptTokens: 5, CompletionTokens: 2},
@@ -111,10 +149,10 @@ func TestNonStreamConversion(t *testing.T) {
 // TestRequestConversion checks tool_use/tool_result round trip in requests.
 func TestRequestConversion(t *testing.T) {
 	in := &AnthropicRequest{
-		Model: "claude-3-5-sonnet",
-		System: AnthropicSystem{Blocks: []AnthropicContent{{Type: "text", Text: "You are helpful"}}},
-		MaxTokens: 1024,
-		Tools: []AnthropicTool{{Name: "run", InputSchema: jsonRawMessage(`{"type":"object","properties":{"cmd":{"type":"string"}}}`)}},
+		Model:      "claude-3-5-sonnet",
+		System:     AnthropicSystem{Blocks: []AnthropicContent{{Type: "text", Text: "You are helpful"}}},
+		MaxTokens:  1024,
+		Tools:      []AnthropicTool{{Name: "run", InputSchema: jsonRawMessage(`{"type":"object","properties":{"cmd":{"type":"string"}}}`)}},
 		ToolChoice: AnthropicToolChoice{Type: "auto"},
 		Messages: []AnthropicMessage{
 			{Role: "user", Content: AnthropicMessageContent{IsStr: true, Text: "do it"}},
@@ -149,6 +187,25 @@ func TestRequestConversion(t *testing.T) {
 	}
 	if out.ToolChoice != "auto" {
 		t.Errorf("tool_choice not mapped: %v", out.ToolChoice)
+	}
+}
+
+func TestRequestConversionDisablesToolsWhenNoneDeclared(t *testing.T) {
+	in := &AnthropicRequest{
+		Model:      "deepseek-v4-flash",
+		MaxTokens:  256,
+		ToolChoice: AnthropicToolChoice{Type: "auto"},
+		Messages: []AnthropicMessage{{
+			Role:    "user",
+			Content: AnthropicMessageContent{IsStr: true, Text: "hello"},
+		}},
+	}
+	out := ConvertRequest(in, func(model string) string { return model })
+	if out.ToolChoice != "none" {
+		t.Fatalf("tool_choice = %#v, want none", out.ToolChoice)
+	}
+	if len(out.Tools) != 0 {
+		t.Fatalf("unexpected tools: %+v", out.Tools)
 	}
 }
 

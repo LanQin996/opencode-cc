@@ -152,6 +152,7 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, resp *http.Respo
 		return
 	}
 	aresp := proxy.ConvertResponse(oresp, inModel)
+	filterUndeclaredToolUses(aresp, areqToolsFromBody(reqBody))
 	writeJSON(w, http.StatusOK, aresp)
 
 	// Log a success row.
@@ -185,6 +186,7 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response
 	if err != nil {
 		return
 	}
+	conv.RestrictTools(anthropicToolNamesFromBody(reqBody))
 
 	// Read the upstream body, transparently decompressing gzip if needed.
 	bodyReader := io.Reader(resp.Body)
@@ -363,6 +365,49 @@ func truncate(s string, n int) string {
 func mustJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+func areqToolsFromBody(body []byte) []proxy.AnthropicTool {
+	var req proxy.AnthropicRequest
+	if json.Unmarshal(body, &req) != nil {
+		return nil
+	}
+	return req.Tools
+}
+
+func anthropicToolNamesFromBody(body []byte) []string {
+	tools := areqToolsFromBody(body)
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		names = append(names, tool.Name)
+	}
+	return names
+}
+
+func filterUndeclaredToolUses(resp *proxy.AnthropicResponse, tools []proxy.AnthropicTool) {
+	if resp == nil {
+		return
+	}
+	allowed := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		allowed[tool.Name] = struct{}{}
+	}
+	filtered := resp.Content[:0]
+	removed := false
+	for _, block := range resp.Content {
+		if block.Type == "tool_use" {
+			if _, ok := allowed[block.Name]; !ok {
+				removed = true
+				continue
+			}
+		}
+		filtered = append(filtered, block)
+	}
+	resp.Content = filtered
+	if removed && resp.StopReason != nil && *resp.StopReason == "tool_use" {
+		stop := "end_turn"
+		resp.StopReason = &stop
+	}
 }
 
 // extractOpenAIError pulls the human message out of an OpenAI error envelope.
