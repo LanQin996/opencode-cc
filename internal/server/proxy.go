@@ -259,15 +259,23 @@ func estimateTokens(areq *proxy.AnthropicRequest) int {
 // ---- logging helpers ----
 
 func (s *Server) logSuccess(ctx context.Context, r *http.Request, inModel, target string, stream bool, status, inputTok, outputTok int, stopReason, reqBody, respBody string, dur time.Duration) {
+	apiKey := APIKeyFromContext(ctx)
 	if !s.shouldLog() {
+		// Still record usage for quota even if request logging is off.
+		s.recordUsage(apiKey, inputTok+outputTok, 1)
 		return
 	}
 	if s.cfg.Snapshot().MaxBodyLogBytes > 0 {
 		reqBody = truncate(reqBody, s.cfg.Snapshot().MaxBodyLogBytes)
 		respBody = truncate(respBody, s.cfg.Snapshot().MaxBodyLogBytes)
 	}
+	var keyID int64
+	if apiKey != nil {
+		keyID = apiKey.ID
+	}
 	go func() {
-		_ = s.store.InsertRequest(context.Background(), &store.RequestRow{
+		bg := context.Background()
+		_ = s.store.InsertRequest(bg, &store.RequestRow{
 			Ts:            time.Now(),
 			Method:        r.Method,
 			Path:          r.URL.Path,
@@ -281,11 +289,27 @@ func (s *Server) logSuccess(ctx context.Context, r *http.Request, inModel, targe
 			StopReason:    stopReason,
 			ReqBody:       reqBody,
 			RespBody:      respBody,
+			APIKeyID:      keyID,
 		})
 	}()
+	s.recordUsage(apiKey, inputTok+outputTok, 1)
+}
+
+// recordUsage bumps the key's quota counters (lifetime + daily). No-op if no
+// authenticated key is present.
+func (s *Server) recordUsage(apiKey *store.APIKey, tokens, requests int) {
+	if apiKey == nil {
+		return
+	}
+	id := apiKey.ID
+	go func() { _ = s.store.RecordUsage(context.Background(), id, tokens, requests) }()
 }
 
 func (s *Server) logFailed(ctx context.Context, r *http.Request, inModel, target string, stream bool, status int, errMsg string, reqBody []byte, dur time.Duration) {
+	apiKey := APIKeyFromContext(ctx)
+	// A failed request still counts as one request against quota (but we don't
+	// charge tokens for requests that never produced a model response).
+	s.recordUsage(apiKey, 0, 1)
 	if !s.shouldLog() {
 		return
 	}
@@ -293,6 +317,10 @@ func (s *Server) logFailed(ctx context.Context, r *http.Request, inModel, target
 	reqStr := string(reqBody)
 	if mb > 0 {
 		reqStr = truncate(reqStr, mb)
+	}
+	var keyID int64
+	if apiKey != nil {
+		keyID = apiKey.ID
 	}
 	go func() {
 		_ = s.store.InsertRequest(context.Background(), &store.RequestRow{
@@ -307,6 +335,7 @@ func (s *Server) logFailed(ctx context.Context, r *http.Request, inModel, target
 			StopReason:    "error",
 			Error:         truncate(errMsg, 2048),
 			ReqBody:       reqStr,
+			APIKeyID:      keyID,
 		})
 	}()
 }

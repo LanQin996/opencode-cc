@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -51,8 +52,36 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) migrate() error {
-	_, err := s.db.Exec(schema)
-	return err
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+	// Additive migrations: each ALTER is idempotent — if the column already
+	// exists SQLite errors, which we ignore. This lets us evolve the requests
+	// table across versions without a full migration framework.
+	for _, stmt := range []string{
+		`ALTER TABLE requests ADD COLUMN api_key_id INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := s.db.Exec(stmt); err != nil && !isDupColumnErr(err) {
+			return err
+		}
+	}
+	// Indexes referencing migrated columns must be created AFTER the ALTERs
+	// (CREATE INDEX inside `schema` runs before them and would fail on an
+	// existing DB where the column was just added).
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_requests_apikey ON requests(api_key_id)`,
+	} {
+		if _, err := s.db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// isDupColumnErr reports whether err is the "duplicate column name" error that
+// ALTER TABLE ADD COLUMN raises when the column already exists.
+func isDupColumnErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "duplicate column")
 }
 
 const schema = `
@@ -71,7 +100,8 @@ CREATE TABLE IF NOT EXISTS requests (
     stop_reason     TEXT    NOT NULL DEFAULT '',
     error           TEXT    NOT NULL DEFAULT '',
     req_body        TEXT    NOT NULL DEFAULT '',
-    resp_body       TEXT    NOT NULL DEFAULT ''
+    resp_body       TEXT    NOT NULL DEFAULT '',
+    api_key_id      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts DESC);
 
@@ -81,6 +111,26 @@ CREATE TABLE IF NOT EXISTS stats_hourly (
     errors          INTEGER NOT NULL DEFAULT 0,
     input_tokens    INTEGER NOT NULL DEFAULT 0,
     output_tokens   INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_hash            TEXT    NOT NULL UNIQUE,
+    key_prefix          TEXT    NOT NULL,
+    name                TEXT    NOT NULL DEFAULT '',
+    enabled             INTEGER NOT NULL DEFAULT 1,
+    token_quota         INTEGER NOT NULL DEFAULT 0,
+    request_quota       INTEGER NOT NULL DEFAULT 0,
+    daily_token_limit   INTEGER NOT NULL DEFAULT 0,
+    daily_request_limit INTEGER NOT NULL DEFAULT 0,
+    allowed_ips         TEXT    NOT NULL DEFAULT '',
+    used_tokens         INTEGER NOT NULL DEFAULT 0,
+    used_requests       INTEGER NOT NULL DEFAULT 0,
+    daily_used_tokens   INTEGER NOT NULL DEFAULT 0,
+    daily_used_requests INTEGER NOT NULL DEFAULT 0,
+    daily_reset_ts      INTEGER NOT NULL DEFAULT 0,
+    created_at          INTEGER NOT NULL DEFAULT 0,
+    expires_at          INTEGER NOT NULL DEFAULT 0
 );
 `
 
@@ -101,6 +151,7 @@ type RequestRow struct {
 	Error         string    `json:"error"`
 	ReqBody       string    `json:"req_body"`
 	RespBody      string    `json:"resp_body"`
+	APIKeyID      int64     `json:"api_key_id"`
 }
 
 // InsertRequest writes one request row and bumps the hourly stats atomically.
@@ -114,11 +165,11 @@ func (s *Store) InsertRequest(ctx context.Context, r *RequestRow) error {
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO requests
 (ts, method, path, incoming_model, target_model, stream, status, duration_ms,
- input_tokens, output_tokens, stop_reason, error, req_body, resp_body)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+ input_tokens, output_tokens, stop_reason, error, req_body, resp_body, api_key_id)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.Ts.UnixMilli(), r.Method, r.Path, r.IncomingModel, r.TargetModel,
 		boolToInt(r.Stream), r.Status, r.DurationMs, r.InputTokens, r.OutputTokens,
-		r.StopReason, r.Error, r.ReqBody, r.RespBody,
+		r.StopReason, r.Error, r.ReqBody, r.RespBody, r.APIKeyID,
 	)
 	if err != nil {
 		return fmt.Errorf("insert request: %w", err)
@@ -151,7 +202,7 @@ func (s *Store) ListRequests(ctx context.Context, limit int) ([]RequestRow, erro
 	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, ts, method, path, incoming_model, target_model, stream, status,
-       duration_ms, input_tokens, output_tokens, stop_reason, error, req_body, resp_body
+       duration_ms, input_tokens, output_tokens, stop_reason, error, req_body, resp_body, api_key_id
 FROM requests ORDER BY ts DESC, id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -164,14 +215,14 @@ FROM requests ORDER BY ts DESC, id DESC LIMIT ?`, limit)
 func (s *Store) GetRequest(ctx context.Context, id int64) (*RequestRow, error) {
 	row := s.db.QueryRowContext(ctx, `
 SELECT id, ts, method, path, incoming_model, target_model, stream, status,
-       duration_ms, input_tokens, output_tokens, stop_reason, error, req_body, resp_body
+       duration_ms, input_tokens, output_tokens, stop_reason, error, req_body, resp_body, api_key_id
 FROM requests WHERE id = ?`, id)
 	r := &RequestRow{}
 	var ts int64
 	var stream int
 	if err := row.Scan(&r.ID, &ts, &r.Method, &r.Path, &r.IncomingModel, &r.TargetModel,
 		&stream, &r.Status, &r.DurationMs, &r.InputTokens, &r.OutputTokens,
-		&r.StopReason, &r.Error, &r.ReqBody, &r.RespBody); err != nil {
+		&r.StopReason, &r.Error, &r.ReqBody, &r.RespBody, &r.APIKeyID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -190,7 +241,7 @@ func scanRows(rows *sql.Rows) ([]RequestRow, error) {
 		var stream int
 		if err := rows.Scan(&r.ID, &ts, &r.Method, &r.Path, &r.IncomingModel, &r.TargetModel,
 			&stream, &r.Status, &r.DurationMs, &r.InputTokens, &r.OutputTokens,
-			&r.StopReason, &r.Error, &r.ReqBody, &r.RespBody); err != nil {
+			&r.StopReason, &r.Error, &r.ReqBody, &r.RespBody, &r.APIKeyID); err != nil {
 			return nil, err
 		}
 		r.Ts = time.UnixMilli(ts)

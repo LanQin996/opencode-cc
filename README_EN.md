@@ -53,6 +53,12 @@ Each protocol implements the `TranslateRequest`, `TranslateResponse`, and `Trans
 - **Web dashboard.** Includes Dashboard for traffic and health data, Models for browsing and filtering, Inspector for
   live request details and protocol routing, and Config for Zen settings, proxy authentication, and hot-reloaded model
   mappings.
+- **Panel password protection.** When `panel_token` is set in `config.json` or via the Settings page, the web
+  dashboard requires password authentication before granting access. After a successful login an HttpOnly session cookie
+  (24-hour TTL) is issued to maintain the session. A logout button is available in the sidebar. When `panel_token` is
+  empty, the panel remains open — suitable for local, single-user deployments.
+- **Client API key management.** Create, disable, and delete client keys from the dashboard, with per-key total token
+  quotas, daily token limits, allowed IPs, and automatic usage tracking.
 - **Secure defaults.** Constant-time Bearer token authentication, request body size limits, per-request panic recovery,
   and graceful shutdown.
 
@@ -149,20 +155,19 @@ Anthropic `messages[]` are translated into a Responses API `input` array contain
 
 ```jsonc
 {
-  "upstream": {
-    "base_url": "https://opencode.ai/zen",
-    "api_key": ""              // Required Bearer token
-  },
-  "proxy": {
-    "listen_addr": ":8787",
-    "auth_token": ""           // Client auth token; empty means open access
-  },
-  "web": { "listen_addr": "", "enabled": true },
+  "listen_addr": ":8787",
+  "upstream_base": "https://opencode.ai/zen",
+  "zen_api_key": "",           // Required Bearer token for the Zen gateway
+  "panel_token": "",           // Web dashboard password; empty means open access
+  "require_api_key": false,    // When true, /v1/* always requires a valid client API key
+  "default_model": "glm-4.6",
   "model_mappings": [
     // Claude Code model string → actual Zen model ID
-    { "claude_model": "claude-sonnet-4-5", "zen_model": "glm-5.1" },
-    { "claude_model": "claude-haiku-4-5", "zen_model": "kimi-k2.5" }
-  ]
+    { "match": "claude-sonnet-4-5", "target": "glm-5.1" },
+    { "match": "*", "target": "" }  // Pass-through fallback
+  ],
+  "log_requests": true,
+  "request_timeout_seconds": 0
 }
 ```
 
@@ -182,15 +187,25 @@ unchanged.
 
 ### Dashboard API
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/config` | Current configuration snapshot |
-| PUT | `/api/config` | Update, persist, and hot-reload the configuration |
-| GET | `/api/status` | Proxy and Zen upstream health |
-| GET | `/api/requests` | Recent `/v1/messages` requests, including the selected protocol |
-| GET | `/api/models` | Zen model catalog with 49 entries |
-| GET | `/api/stats` | Hourly, per-model, and aggregate statistics |
-| GET | `/api/test` | Ping Zen through `GET /v1/models` |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/health` | None | Liveness probe |
+| GET | `/api/auth/check` | None | Reports whether login is required and whether the current request is authenticated |
+| POST | `/api/auth/login` | None | Verifies the panel password and sets an HttpOnly session cookie on success |
+| POST | `/api/auth/logout` | None | Destroys the session and clears the cookie |
+| GET | `/api/config` | Required | Current configuration snapshot (Zen API key masked) |
+| PUT | `/api/config` | Required | Update, persist, and hot-reload the configuration |
+| GET | `/api/stats/summary` | Required | Request count and token totals |
+| GET | `/api/stats/hourly` | Required | Hourly time series |
+| GET | `/api/stats/models` | Required | Per-model usage breakdown |
+| GET | `/api/stats/latency` | Required | P50/P95/P99 latency percentiles |
+| GET | `/api/logs` | Required | Request log list |
+| GET | `/api/logs/{id}` | Required | Individual log entry with request and response bodies |
+| GET/POST | `/api/keys` | Required | List or create API keys |
+| GET/PUT/DELETE | `/api/keys/{id}` | Required | Read, update, or delete an API key |
+| POST | `/api/keys/{id}/reset` | Required | Reset API key usage counters |
+| GET | `/api/keys/{id}/usage` | Required | Read API key usage details |
+| GET | `/api/test` | Required | Test upstream connectivity |
 
 ## Project Structure
 

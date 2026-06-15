@@ -53,6 +53,7 @@ export interface PanelConfig {
   zen_api_key_masked: string;
   zen_api_key_set: boolean;
   panel_token_set: boolean;
+  require_api_key: boolean;
   default_model: string;
   model_mappings: { match: string; target: string }[];
   log_requests: boolean;
@@ -68,6 +69,52 @@ export interface TestResult {
   completion_tokens?: number;
   preview?: string;
   error?: string;
+}
+
+export interface APIKey {
+  id: number;
+  key_prefix: string;
+  name: string;
+  enabled: boolean;
+  token_quota: number;
+  request_quota: number;
+  daily_token_limit: number;
+  daily_request_limit: number;
+  allowed_ips: string;
+  used_tokens: number;
+  used_requests: number;
+  daily_used_tokens: number;
+  daily_used_requests: number;
+  daily_reset_ts: number;
+  created_at: number;
+  expires_at: number;
+}
+
+export interface APIKeyCreated extends APIKey {
+  plain_key: string;
+}
+
+export interface KeyUsagePoint {
+  day: number;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+}
+
+export interface KeyBody {
+  name: string;
+  enabled?: boolean;
+  token_quota: number;
+  request_quota: number;
+  daily_token_limit: number;
+  daily_request_limit: number;
+  allowed_ips: string;
+  expires_at: number;
+}
+
+export interface AuthCheckResult {
+  need_auth: boolean;
+  authenticated: boolean;
 }
 
 async function asJson<T>(res: Response): Promise<T> {
@@ -105,4 +152,33 @@ export const api = {
     fetch(`/api/test${model ? `?model=${encodeURIComponent(model)}` : ""}`).then((r) =>
       asJson<TestResult>(r)
     ),
+  keys: () => fetch("/api/keys").then((r) => asArray<APIKey>(r)),
+  createKey: (body: KeyBody) =>
+    fetch("/api/keys", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((r) => asJson<APIKeyCreated>(r)),
+  updateKey: (id: number, body: KeyBody) =>
+    fetch(`/api/keys/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((r) => asJson<APIKey>(r)),
+  deleteKey: (id: number) =>
+    fetch(`/api/keys/${id}`, { method: "DELETE" }).then((r) => asJson<{ ok: boolean }>(r)),
+  resetKey: (id: number) =>
+    fetch(`/api/keys/${id}/reset`, { method: "POST" }).then((r) => asJson<{ ok: boolean }>(r)),
+  keyUsage: (id: number, days = 14) =>
+    fetch(`/api/keys/${id}/usage?days=${days}`).then((r) => asArray<KeyUsagePoint>(r)),
+  checkAuth: () =>
+    fetch("/api/auth/check").then((r) => asJson<AuthCheckResult>(r)),
+  login: (password: string) =>
+    fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    }).then((r) => asJson<{ ok: boolean }>(r)),
+  logout: () =>
+    fetch("/api/auth/logout", { method: "POST" }).then((r) => asJson<{ ok: boolean }>(r)),
 };

@@ -221,3 +221,48 @@ func TestProxyMissingKey(t *testing.T) {
 		t.Errorf("unexpected error body: %s", rr.Body.String())
 	}
 }
+
+func TestProxyAuthenticatedUsageIsRecorded(t *testing.T) {
+	zen := mockZen(t, false, nil)
+	srv, st := newTestServer(t, zen.URL)
+	srv.cfg.RequireAPIKey = true
+	plain, err := st.CreateKey(context.Background(), store.KeyOpts{Name: "usage-test", Enabled: true})
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	key, err := st.LookupKeyByHash(context.Background(), store.HashKey(plain))
+	if err != nil || key == nil {
+		t.Fatalf("lookup key: key=%+v err=%v", key, err)
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"model":      "claude-test",
+		"max_tokens": 32,
+		"messages": []map[string]any{
+			{"role": "user", "content": "hi"},
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+plain)
+	rr := httptest.NewRecorder()
+	srv.clientAuth(srv.Proxy()).ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rr.Code, rr.Body.String())
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got, lookupErr := st.GetKey(context.Background(), key.ID)
+		rows, rowsErr := st.ListRequests(context.Background(), 1)
+		if lookupErr == nil && rowsErr == nil && got != nil &&
+			got.UsedRequests == 1 && got.UsedTokens == 16 &&
+			len(rows) == 1 && rows[0].APIKeyID == key.ID {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	got, _ := st.GetKey(context.Background(), key.ID)
+	rows, _ := st.ListRequests(context.Background(), 1)
+	t.Fatalf("usage was not recorded: key=%+v rows=%+v", got, rows)
+}

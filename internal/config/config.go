@@ -44,6 +44,10 @@ type Config struct {
 	// PanelToken gates access to the web panel and its API. If empty the panel
 	// is open (convenient for local use). Set one before exposing the port.
 	PanelToken string `json:"panel_token"`
+	// RequireAPIKey gates the /v1/* proxy endpoints behind a valid client API
+	// key. When true, requests must carry a Bearer key matching one in the
+	// api_keys table. When false, access is open for local single-user use.
+	RequireAPIKey bool `json:"require_api_key"`
 	// DefaultModel is used when the incoming request has no model and no
 	// mapping matches.
 	DefaultModel string `json:"default_model"`
@@ -63,11 +67,27 @@ type Config struct {
 	mu         sync.RWMutex
 }
 
+// Patch represents a partial update from the control panel. Pointer fields
+// distinguish omitted JSON properties from explicit zero values.
+type Patch struct {
+	ListenAddr            *string         `json:"listen_addr"`
+	UpstreamBase          *string         `json:"upstream_base"`
+	ZenAPIKey             *string         `json:"zen_api_key"`
+	PanelToken            *string         `json:"panel_token"`
+	RequireAPIKey         *bool           `json:"require_api_key"`
+	DefaultModel          *string         `json:"default_model"`
+	ModelMappings         *[]ModelMapping `json:"model_mappings"`
+	LogRequests           *bool           `json:"log_requests"`
+	MaxBodyLogBytes       *int            `json:"max_body_log_bytes"`
+	RequestTimeoutSeconds *int            `json:"request_timeout_seconds"`
+}
+
 // Default returns a Config populated with sensible defaults.
 func Default() *Config {
 	return &Config{
 		ListenAddr:            DefaultListenAddr,
 		UpstreamBase:          DefaultUpstreamBase,
+		RequireAPIKey:         false, // open by default for single-user local use
 		DefaultModel:          DefaultDefaultModel,
 		ModelMappings:         DefaultModelMappings(),
 		LogRequests:           true,
@@ -126,6 +146,11 @@ func (c *Config) applyEnv() {
 	if v := os.Getenv("OPENCODE_CC_PANEL_TOKEN"); v != "" {
 		c.PanelToken = v
 	}
+	if v := os.Getenv("OPENCODE_CC_REQUIRE_API_KEY"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.RequireAPIKey = b
+		}
+	}
 	if v := os.Getenv("OPENCODE_CC_DEFAULT_MODEL"); v != "" {
 		c.DefaultModel = v
 	}
@@ -174,6 +199,7 @@ func (c *Config) Snapshot() *Config {
 		UpstreamBase:          c.UpstreamBase,
 		ZenAPIKey:             c.ZenAPIKey,
 		PanelToken:            c.PanelToken,
+		RequireAPIKey:         c.RequireAPIKey,
 		DefaultModel:          c.DefaultModel,
 		LogRequests:           c.LogRequests,
 		MaxBodyLogBytes:       c.MaxBodyLogBytes,
@@ -244,36 +270,39 @@ func (c *Config) SetZenAPIKey(v string) {
 	c.ZenAPIKey = v
 }
 
-// Apply merges a partial config coming from the panel. Only fields the caller
-// is allowed to change are taken from src.
-func (c *Config) Apply(src *Config) {
+// ApplyPatch merges an explicitly partial config update from the panel.
+func (c *Config) ApplyPatch(src *Patch) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if src.ListenAddr != "" {
-		c.ListenAddr = src.ListenAddr
+	if src.ListenAddr != nil && *src.ListenAddr != "" {
+		c.ListenAddr = *src.ListenAddr
 	}
-	if src.UpstreamBase != "" {
-		c.UpstreamBase = strings.TrimRight(src.UpstreamBase, "/")
+	if src.UpstreamBase != nil && *src.UpstreamBase != "" {
+		c.UpstreamBase = strings.TrimRight(*src.UpstreamBase, "/")
 	}
 	// ZenAPIKey: empty means "don't change" so the panel never clobbers it.
-	if src.ZenAPIKey != "" {
-		c.ZenAPIKey = src.ZenAPIKey
+	if src.ZenAPIKey != nil && *src.ZenAPIKey != "" {
+		c.ZenAPIKey = *src.ZenAPIKey
 	}
-	if src.PanelTokenSet() {
-		c.PanelToken = src.PanelToken
+	if src.PanelToken != nil {
+		c.PanelToken = *src.PanelToken
 	}
-	if src.DefaultModel != "" {
-		c.DefaultModel = src.DefaultModel
+	if src.RequireAPIKey != nil {
+		c.RequireAPIKey = *src.RequireAPIKey
+	}
+	if src.DefaultModel != nil && *src.DefaultModel != "" {
+		c.DefaultModel = *src.DefaultModel
 	}
 	if src.ModelMappings != nil {
-		c.ModelMappings = append([]ModelMapping(nil), src.ModelMappings...)
+		c.ModelMappings = append([]ModelMapping(nil), (*src.ModelMappings)...)
 	}
-	c.LogRequests = src.LogRequests
-	if src.MaxBodyLogBytes > 0 {
-		c.MaxBodyLogBytes = src.MaxBodyLogBytes
+	if src.LogRequests != nil {
+		c.LogRequests = *src.LogRequests
 	}
-	c.RequestTimeoutSeconds = src.RequestTimeoutSeconds
+	if src.MaxBodyLogBytes != nil && *src.MaxBodyLogBytes >= 0 {
+		c.MaxBodyLogBytes = *src.MaxBodyLogBytes
+	}
+	if src.RequestTimeoutSeconds != nil && *src.RequestTimeoutSeconds >= 0 {
+		c.RequestTimeoutSeconds = *src.RequestTimeoutSeconds
+	}
 }
-
-// PanelTokenSet reports whether src carries a panel token change.
-func (c *Config) PanelTokenSet() bool { return c != nil && c.PanelToken != "__unchanged__" }

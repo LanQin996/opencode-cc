@@ -1,5 +1,6 @@
-import { ReactNode, useEffect, useState } from "react";
+import { FormEvent, ReactNode, useEffect, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
+import { api } from "./lib/api";
 
 function Logo() {
   return (
@@ -20,6 +21,7 @@ function Logo() {
 const NAV = [
   { to: "/", label: "仪表盘", icon: DashIcon, end: true },
   { to: "/logs", label: "请求日志", icon: ListIcon },
+  { to: "/keys", label: "API 密钥", icon: KeyNavIcon },
   { to: "/models", label: "模型路由", icon: CubeIcon },
   { to: "/settings", label: "设置", icon: GearIcon },
 ];
@@ -98,6 +100,131 @@ function StatusBar() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Authentication guard
+// ---------------------------------------------------------------------------
+
+/** Wraps the whole app; shows login page when the panel requires auth. */
+export function AuthGuard({ children }: { children: ReactNode }) {
+  const [state, setState] = useState<"loading" | "open" | "needlogin" | "authed">("loading");
+
+  useEffect(() => {
+    api
+      .checkAuth()
+      .then((r) => {
+        if (!r.need_auth) setState("open");
+        else if (r.authenticated) setState("authed");
+        else setState("needlogin");
+      })
+      .catch(() => setState("needlogin"));
+  }, []);
+
+  if (state === "loading") {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="w-6 h-6 rounded-full border-2 border-accent border-t-transparent animate-spin" />
+      </div>
+    );
+  }
+
+  if (state === "needlogin") {
+    return <LoginPage onLogin={() => setState("authed")} />;
+  }
+
+  return <>{children}</>;
+}
+
+function LoginPage({ onLogin }: { onLogin: () => void }) {
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!password) return;
+    setLoading(true);
+    setError("");
+    try {
+      await api.login(password);
+      onLogin();
+    } catch {
+      setError("密码错误，请重试");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center px-4">
+      <div className="w-full max-w-sm">
+        <div className="flex justify-center mb-8">
+          <Logo />
+        </div>
+        <div className="rounded-2xl border border-white/[0.06] bg-ink-950/60 backdrop-blur-xl shadow-card p-8">
+          <h2 className="text-lg font-semibold text-white mb-1 text-center">管理员登录</h2>
+          <p className="text-sm text-slate-500 text-center mb-6">请输入面板密码以继续</p>
+          <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+            <div className="flex flex-col gap-1.5">
+              <label className="text-xs text-slate-400 font-medium">面板密码</label>
+              <input
+                type="password"
+                autoFocus
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••••"
+                className="w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-3 py-2.5 text-sm text-white placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-accent"
+              />
+            </div>
+            {error && (
+              <p className="text-xs text-accent-red text-center">{error}</p>
+            )}
+            <button
+              type="submit"
+              disabled={loading || !password}
+              className="mt-1 w-full rounded-xl bg-accent hover:bg-accent/90 disabled:opacity-50 disabled:cursor-not-allowed px-4 py-2.5 text-sm font-medium text-white transition-colors"
+            >
+              {loading ? "验证中…" : "登录"}
+            </button>
+          </form>
+        </div>
+        <p className="text-center text-xs text-slate-600 mt-4">
+          在 Settings 页面可修改或清除面板密码
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function LogoutButton() {
+  const [pending, setPending] = useState(false);
+
+  const handleLogout = async () => {
+    setPending(true);
+    try {
+      await api.logout();
+    } finally {
+      window.location.reload();
+    }
+  };
+
+  return (
+    <button
+      onClick={handleLogout}
+      disabled={pending}
+      className="flex items-center gap-2 text-xs text-slate-500 hover:text-slate-300 transition-colors disabled:opacity-50"
+      title="退出登录"
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+        <polyline points="16 17 21 12 16 7" />
+        <line x1="21" y1="12" x2="9" y2="12" />
+      </svg>
+      退出登录
+    </button>
+  );
+}
+
 export default function App() {
   return (
     <div className="min-h-screen flex">
@@ -111,8 +238,9 @@ export default function App() {
             <NavItem key={n.to} {...n} />
           ))}
         </nav>
-        <div className="mt-auto px-5 py-4 border-t border-white/[0.05]">
+        <div className="mt-auto px-5 py-4 border-t border-white/[0.05] flex flex-col gap-2">
           <StatusBar />
+          <LogoutButton />
         </div>
       </aside>
 
@@ -139,6 +267,14 @@ export default function App() {
 
 // --- Icons (inline SVGs, no extra deps) ---
 type IconProps = { className?: string };
+function KeyNavIcon({ className }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <circle cx="8" cy="15" r="4" />
+      <path d="M10.85 12.15L19 4M18 5l2 2M15 8l2 2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
 function DashIcon({ className }: IconProps) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">

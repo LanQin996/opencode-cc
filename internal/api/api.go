@@ -4,16 +4,61 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kiowx/opencode-cc/internal/config"
 	"github.com/Kiowx/opencode-cc/internal/metrics"
 	"github.com/Kiowx/opencode-cc/internal/store"
 )
+
+// ---------------------------------------------------------------------------
+// Session management (in-memory; processes restart invalidate sessions)
+// ---------------------------------------------------------------------------
+
+const sessionCookieName = "opencode_cc_session"
+const sessionTTL = 24 * time.Hour
+
+var sessions sync.Map // sessionToken(string) → time.Time expiry
+
+// newSessionToken generates a cryptographically random 32-byte hex session token.
+func newSessionToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// isValidSession returns true if the token exists and has not expired.
+func isValidSession(token string) bool {
+	if token == "" {
+		return false
+	}
+	v, ok := sessions.Load(token)
+	if !ok {
+		return false
+	}
+	exp, _ := v.(time.Time)
+	if time.Now().After(exp) {
+		sessions.Delete(token)
+		return false
+	}
+	return true
+}
+
+func invalidateSessions() {
+	sessions.Range(func(key, _ any) bool {
+		sessions.Delete(key)
+		return true
+	})
+}
 
 // API holds dependencies shared by all panel handlers.
 type API struct {
@@ -29,6 +74,10 @@ func New(cfg *config.Config, st *store.Store) *API {
 // Mount registers the API routes on mux under /api.
 func (a *API) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("/api/health", a.health)
+	// Auth endpoints are intentionally unauthenticated.
+	mux.HandleFunc("/api/auth/login", a.handleLogin)
+	mux.HandleFunc("/api/auth/logout", a.handleLogout)
+	mux.HandleFunc("/api/auth/check", a.handleAuthCheck)
 	mux.Handle("/api/config", a.auth(http.HandlerFunc(a.configHandler)))
 	mux.Handle("/api/test", a.auth(http.HandlerFunc(a.testUpstream)))
 	mux.Handle("/api/stats/summary", a.auth(http.HandlerFunc(a.summary)))
@@ -37,7 +86,13 @@ func (a *API) Mount(mux *http.ServeMux) {
 	mux.Handle("/api/stats/latency", a.auth(http.HandlerFunc(a.latency)))
 	mux.Handle("/api/logs", a.auth(http.HandlerFunc(a.logs)))
 	mux.Handle("/api/logs/", a.auth(http.HandlerFunc(a.logDetail)))
+	mux.Handle("/api/keys", a.auth(http.HandlerFunc(a.keysHandler)))
+	mux.Handle("/api/keys/", a.auth(http.HandlerFunc(a.keysHandler)))
 }
+
+// SetInvalidateCache wires the cache-invalidation callback from the server
+// package (avoids an api → server import cycle). Called after key mutations.
+func SetInvalidateCache(fn func()) { invalidateCache = fn }
 
 // auth gates the panel API behind the configured panel token. If no token is
 // configured, access is open (convenient for localhost-only use).
@@ -50,18 +105,22 @@ func (a *API) auth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		// Accept either a Bearer header or ?token= / cookie for browser use.
-		provided := r.Header.Get("Authorization")
-		provided = strings.TrimPrefix(provided, "Bearer ")
+		// Accept Bearer header / ?token= with the raw panel token (API / scripted access).
+		provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if provided == "" {
 			provided = r.URL.Query().Get("token")
 		}
-		if provided == "" {
-			if c, _ := r.Cookie("opencode_cc_token"); c != nil {
-				provided = c.Value
-			}
+		if provided != "" && subtleEqual(provided, token) {
+			next.ServeHTTP(w, r)
+			return
 		}
-		if subtleEqual(provided, token) {
+		// Accept a valid session cookie (web login flow).
+		if c, _ := r.Cookie(sessionCookieName); c != nil && isValidSession(c.Value) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Legacy: raw token stored directly in cookie (backward compat).
+		if c, _ := r.Cookie("opencode_cc_token"); c != nil && subtleEqual(c.Value, token) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -98,24 +157,120 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// configHandler GET returns the current config (with sensitive fields masked),
-// PUT updates it. The Zen API key is never returned in full; PUT uses the
-// sentinel "__unchanged__" to mean "leave as-is".
+// ---------------------------------------------------------------------------
+// Auth endpoints (unauthenticated, used by the web login flow)
+// ---------------------------------------------------------------------------
+
+// handleAuthCheck reports whether the panel requires authentication and
+// whether the current request is already authenticated.
+func (a *API) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	a.cfg.RLock()
+	token := a.cfg.PanelToken
+	a.cfg.RUnlock()
+
+	if token == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"need_auth": false, "authenticated": true})
+		return
+	}
+	// Check session cookie.
+	if c, _ := r.Cookie(sessionCookieName); c != nil && isValidSession(c.Value) {
+		writeJSON(w, http.StatusOK, map[string]any{"need_auth": true, "authenticated": true})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"need_auth": true, "authenticated": false})
+}
+
+// handleLogin verifies a password against the panel token and, on success,
+// creates an in-memory session and sets an HttpOnly cookie.
+func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		return
+	}
+
+	a.cfg.RLock()
+	token := a.cfg.PanelToken
+	a.cfg.RUnlock()
+
+	if token == "" || !subtleEqual(body.Password, token) {
+		// Fixed delay to slow brute-force attempts.
+		time.Sleep(500 * time.Millisecond)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "密码错误"})
+		return
+	}
+
+	tok, err := newSessionToken()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	sessions.Store(tok, time.Now().Add(sessionTTL))
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    tok,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   int(sessionTTL.Seconds()),
+	})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleLogout deletes the current session and clears the session cookie.
+func (a *API) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if c, _ := r.Cookie(sessionCookieName); c != nil {
+		sessions.Delete(c.Value)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   -1,
+	})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// configHandler GET returns the current config (with sensitive fields masked);
+// PUT applies only the JSON fields present in the request.
 func (a *API) configHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		snap := a.cfg.Snapshot()
 		writeJSON(w, http.StatusOK, publicConfig(snap))
 	case http.MethodPut:
-		var in config.Config
+		var in config.Patch
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		a.cfg.Apply(&in)
+		oldPanelToken := a.cfg.Snapshot().PanelToken
+		a.cfg.ApplyPatch(&in)
 		if err := a.cfg.Save(); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
+		}
+		if in.PanelToken != nil && *in.PanelToken != oldPanelToken {
+			invalidateSessions()
 		}
 		writeJSON(w, http.StatusOK, publicConfig(a.cfg.Snapshot()))
 	default:
@@ -140,6 +295,7 @@ func publicConfig(c *config.Config) map[string]any {
 		"zen_api_key_masked":      masked,
 		"zen_api_key_set":         key != "",
 		"panel_token_set":         c.PanelToken != "",
+		"require_api_key":         c.RequireAPIKey,
 		"default_model":           c.DefaultModel,
 		"model_mappings":          c.ModelMappings,
 		"log_requests":            c.LogRequests,

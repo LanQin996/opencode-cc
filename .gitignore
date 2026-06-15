@@ -2,6 +2,7 @@
 /opencode-cc
 /opencode-cc.exe
 /opencode-cc-*
+*.exe~
 
 # Local runtime data (config + SQLite db)
 /data/

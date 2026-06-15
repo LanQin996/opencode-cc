@@ -41,14 +41,14 @@ func New(cfg *config.Config, st *store.Store) *Server {
 func (s *Server) Handler(panelAssets http.FileSystem, panelMux http.Handler) http.Handler {
 	mux := http.NewServeMux()
 
-	// ---- Anthropic-compatible endpoints ----
-	mux.HandleFunc("/v1/messages", s.Proxy())
-	mux.HandleFunc("/v1/messages/count_tokens", s.CountTokens())
-	mux.Handle("/v1/models", proxy.ModelsHandler(
+	// ---- Anthropic-compatible endpoints (gated by client API key) ----
+	mux.Handle("/v1/messages", s.clientAuth(s.Proxy()))
+	mux.Handle("/v1/messages/count_tokens", s.clientAuth(s.CountTokens()))
+	mux.Handle("/v1/models", s.clientAuth(proxy.ModelsHandler(
 		s.httpClient,
 		func() string { return s.cfg.Snapshot().UpstreamBase },
 		func() string { return s.cfg.Snapshot().ZenAPIKey },
-	))
+	)))
 
 	// ---- Panel API (mounted under /api) ----
 	s.mountPanelAPI(mux)
@@ -101,6 +101,7 @@ func (s *Server) Shutdown() error {
 
 // mountPanelAPI wires the panel's REST API onto mux via the api package.
 func (s *Server) mountPanelAPI(mux *http.ServeMux) {
+	api.SetInvalidateCache(InvalidateKeyCache)
 	api.New(s.cfg, s.store).Mount(mux)
 }
 

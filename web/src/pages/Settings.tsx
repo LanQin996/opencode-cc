@@ -10,9 +10,16 @@ export default function Settings() {
   const [logReqs, setLogReqs] = useState(true);
   const [maxBody, setMaxBody] = useState(16384);
   const [timeout, setTimeoutSecs] = useState(0);
+  const [requireKey, setRequireKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [flash, setFlash] = useState("");
+
+  // Panel password state
+  const [newPanelToken, setNewPanelToken] = useState("");
+  const [confirmPanelToken, setConfirmPanelToken] = useState("");
+  const [panelTokenError, setPanelTokenError] = useState("");
+  const [panelTokenFlash, setPanelTokenFlash] = useState("");
 
   useEffect(() => {
     api.getConfig().then((c) => {
@@ -21,8 +28,30 @@ export default function Settings() {
       setLogReqs(c.log_requests);
       setMaxBody(c.max_body_log_bytes);
       setTimeoutSecs(c.request_timeout_seconds);
+      setRequireKey(c.require_api_key);
     });
   }, []);
+
+  async function savePanelToken() {
+    setPanelTokenError("");
+    if (newPanelToken !== confirmPanelToken) {
+      setPanelTokenError("两次输入的密码不一致");
+      return;
+    }
+    setSaving(true);
+    try {
+      const updated = await api.putConfig({ panel_token: newPanelToken });
+      setCfg(updated);
+      setNewPanelToken("");
+      setConfirmPanelToken("");
+      setPanelTokenFlash(newPanelToken === "" ? "面板密码已清除。" : "面板密码已更新。");
+      setTimeout(() => setPanelTokenFlash(""), 2500);
+      // If a password was just set, reload so AuthGuard picks up the new state.
+      if (newPanelToken !== "") setTimeout(() => window.location.reload(), 1000);
+    } finally {
+      setSaving(false);
+    }
+  }
 
   async function save() {
     setSaving(true);
@@ -32,6 +61,7 @@ export default function Settings() {
         log_requests: logReqs,
         max_body_log_bytes: maxBody,
         request_timeout_seconds: timeout,
+        require_api_key: requireKey,
       };
       // Only send the API key if the user typed a new one.
       if (apiKey.trim()) body.zen_api_key = apiKey.trim();
@@ -127,6 +157,18 @@ export default function Settings() {
           }}
         />
 
+        <div className="mt-4">
+          <Toggle
+            label="要求 API 密钥"
+            desc="开启后，/v1/* 代理端点必须携带有效的客户端密钥（见「API 密钥」页）。请先创建密钥再开启。"
+            checked={requireKey}
+            onChange={(v) => {
+              setRequireKey(v);
+              setDirty(true);
+            }}
+          />
+        </div>
+
         <div className="grid grid-cols-2 gap-4 mt-4">
           <div>
             <label className="label">日志最大体积（字节）</label>
@@ -157,6 +199,55 @@ export default function Settings() {
         </div>
       </Card>
 
+      <Card className="mb-4">
+        <div className="flex items-center gap-2 mb-4">
+          <LockIcon />
+          <h3 className="text-sm font-semibold text-slate-200">面板访问密码</h3>
+          {cfg.panel_token_set ? <Badge tone="green">已设置</Badge> : <Badge tone="amber">未设置（开放访问）</Badge>}
+        </div>
+        <p className="text-xs text-slate-500 mb-4">
+          设置密码后，访问控制面板需先通过登录页验证。留空并保存可清除密码、恢复开放访问。
+        </p>
+
+        <label className="label">新密码</label>
+        <input
+          type="password"
+          className="input mb-3"
+          placeholder="输入新密码，留空则清除"
+          value={newPanelToken}
+          autoComplete="new-password"
+          onChange={(e) => setNewPanelToken(e.target.value)}
+        />
+
+        <label className="label">确认新密码</label>
+        <input
+          type="password"
+          className="input mb-3"
+          placeholder="再次输入新密码"
+          value={confirmPanelToken}
+          autoComplete="new-password"
+          onChange={(e) => setConfirmPanelToken(e.target.value)}
+        />
+
+        {panelTokenError && (
+          <p className="text-xs text-accent-red mb-3">{panelTokenError}</p>
+        )}
+
+        <div className="flex items-center gap-3">
+          <button
+            onClick={savePanelToken}
+            disabled={saving}
+            className="btn-primary"
+          >
+            {saving ? <Spinner /> : <SaveIcon />}
+            {newPanelToken === "" ? "清除密码" : "设置密码"}
+          </button>
+          {panelTokenFlash && (
+            <span className="text-xs text-accent-green">{panelTokenFlash}</span>
+          )}
+        </div>
+      </Card>
+
       <Card>
         <div className="flex items-center gap-2 mb-4">
           <TerminalIcon />
@@ -168,18 +259,18 @@ export default function Settings() {
         <pre className="rounded-xl bg-ink-950/80 border border-white/[0.05] p-4 text-xs font-mono text-slate-300 overflow-x-auto">
 {`# Bash / zsh
 export ANTHROPIC_BASE_URL=http://localhost:${cfg.listen_addr.split(":").pop() || "8787"}
-export ANTHROPIC_AUTH_TOKEN=anything
+export ANTHROPIC_AUTH_TOKEN=${requireKey ? "sk-your-client-key" : "anything"}
 claude
 
 # PowerShell
 $env:ANTHROPIC_BASE_URL="http://localhost:${cfg.listen_addr.split(":").pop() || "8787"}"
-$env:ANTHROPIC_AUTH_TOKEN="anything"
+$env:ANTHROPIC_AUTH_TOKEN="${requireKey ? "sk-your-client-key" : "anything"}"
 claude`}
         </pre>
         <p className="text-xs text-slate-500 mt-3">
-          AUTH_TOKEN 的值无关紧要——代理始终用你的 Zen Key 向上游鉴权。仅当你把这个端口暴露到本机以外时，才需要在
-          <span className="text-slate-400"> config.json</span> 中设置
-          <span className="text-slate-400"> 面板访问令牌</span>。
+          {requireKey
+            ? "已启用客户端鉴权，请使用「API 密钥」页创建的密钥作为 AUTH_TOKEN。"
+            : "未启用客户端鉴权时，AUTH_TOKEN 的值无关紧要；代理仍使用你的 Zen Key 向上游鉴权。"}
         </p>
       </Card>
     </div>
@@ -246,6 +337,14 @@ function TerminalIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-slate-500">
       <path d="M4 17l6-6-6-6M12 19h8" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+function LockIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-slate-500">
+      <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+      <path d="M7 11V7a5 5 0 0 1 10 0v4" strokeLinecap="round" />
     </svg>
   );
 }
