@@ -33,6 +33,19 @@ type ModelMapping struct {
 	Target string `json:"target"`
 }
 
+// ThinkingBudgetMapping maps Anthropic extended-thinking budgets to model-
+// specific OpenAI-compatible request fields. Field currently supports
+// "thinking", "thinking_budget" and "reasoning_effort"; empty/"none" disables
+// forwarding.
+type ThinkingBudgetMapping struct {
+	Match  string `json:"match"`
+	Field  string `json:"field"`
+	Low    int    `json:"low,omitempty"`
+	Medium int    `json:"medium,omitempty"`
+	High   int    `json:"high,omitempty"`
+	Max    int    `json:"max,omitempty"`
+}
+
 // Config is the full application configuration.
 type Config struct {
 	ListenAddr string `json:"listen_addr"`
@@ -77,6 +90,9 @@ type Config struct {
 	// PromptCacheNormalize keeps cacheable request structure stable: system
 	// messages first, sorted tools/context blocks, and volatile metadata removed.
 	PromptCacheNormalize bool `json:"prompt_cache_normalize"`
+	// ThinkingBudgetMappings are evaluated by target model. They translate
+	// Anthropic thinking budget_tokens into provider-specific request fields.
+	ThinkingBudgetMappings []ThinkingBudgetMapping `json:"thinking_budget_mappings"`
 
 	dataDir    string
 	configPath string
@@ -86,21 +102,22 @@ type Config struct {
 // Patch represents a partial update from the control panel. Pointer fields
 // distinguish omitted JSON properties from explicit zero values.
 type Patch struct {
-	ListenAddr                  *string         `json:"listen_addr"`
-	UpstreamBase                *string         `json:"upstream_base"`
-	NativeAnthropic             *bool           `json:"native_anthropic"`
-	ZenAPIKey                   *string         `json:"zen_api_key"`
-	PanelToken                  *string         `json:"panel_token"`
-	RequireAPIKey               *bool           `json:"require_api_key"`
-	DefaultModel                *string         `json:"default_model"`
-	ModelMappings               *[]ModelMapping `json:"model_mappings"`
-	LogRequests                 *bool           `json:"log_requests"`
-	MaxBodyLogBytes             *int            `json:"max_body_log_bytes"`
-	RequestTimeoutSeconds       *int            `json:"request_timeout_seconds"`
-	PromptCacheEnabled          *bool           `json:"prompt_cache_enabled"`
-	PromptCacheKeyPrefix        *string         `json:"prompt_cache_key_prefix"`
-	PromptCacheAnthropicControl *bool           `json:"prompt_cache_anthropic_control"`
-	PromptCacheNormalize        *bool           `json:"prompt_cache_normalize"`
+	ListenAddr                  *string                  `json:"listen_addr"`
+	UpstreamBase                *string                  `json:"upstream_base"`
+	NativeAnthropic             *bool                    `json:"native_anthropic"`
+	ZenAPIKey                   *string                  `json:"zen_api_key"`
+	PanelToken                  *string                  `json:"panel_token"`
+	RequireAPIKey               *bool                    `json:"require_api_key"`
+	DefaultModel                *string                  `json:"default_model"`
+	ModelMappings               *[]ModelMapping          `json:"model_mappings"`
+	LogRequests                 *bool                    `json:"log_requests"`
+	MaxBodyLogBytes             *int                     `json:"max_body_log_bytes"`
+	RequestTimeoutSeconds       *int                     `json:"request_timeout_seconds"`
+	PromptCacheEnabled          *bool                    `json:"prompt_cache_enabled"`
+	PromptCacheKeyPrefix        *string                  `json:"prompt_cache_key_prefix"`
+	PromptCacheAnthropicControl *bool                    `json:"prompt_cache_anthropic_control"`
+	PromptCacheNormalize        *bool                    `json:"prompt_cache_normalize"`
+	ThinkingBudgetMappings      *[]ThinkingBudgetMapping `json:"thinking_budget_mappings"`
 }
 
 // Default returns a Config populated with sensible defaults.
@@ -119,6 +136,7 @@ func Default() *Config {
 		PromptCacheKeyPrefix:        "opencode-cc",
 		PromptCacheAnthropicControl: true,
 		PromptCacheNormalize:        true,
+		ThinkingBudgetMappings:      DefaultThinkingBudgetMappings(),
 	}
 }
 
@@ -131,6 +149,17 @@ func Default() *Config {
 func DefaultModelMappings() []ModelMapping {
 	return []ModelMapping{
 		{Match: "*", Target: ""}, // pass-through
+	}
+}
+
+// DefaultThinkingBudgetMappings keeps provider-specific thinking controls off
+// by default except where Zen-compatible model families document a matching
+// extension field.
+func DefaultThinkingBudgetMappings() []ThinkingBudgetMapping {
+	return []ThinkingBudgetMapping{
+		{Match: "glm-", Field: "thinking"},
+		{Match: "kimi-", Field: "thinking_budget", Low: 1024, Medium: 4096, High: 8192, Max: 16384},
+		{Match: "moonshot-", Field: "thinking_budget", Low: 1024, Medium: 4096, High: 8192, Max: 16384},
 	}
 }
 
@@ -262,6 +291,9 @@ func (c *Config) Snapshot() *Config {
 	if c.ModelMappings != nil {
 		cp.ModelMappings = append([]ModelMapping(nil), c.ModelMappings...)
 	}
+	if c.ThinkingBudgetMappings != nil {
+		cp.ThinkingBudgetMappings = append([]ThinkingBudgetMapping(nil), c.ThinkingBudgetMappings...)
+	}
 	// dataDir / configPath are deliberately left zero (unpersisted bookkeeping).
 	return cp
 }
@@ -297,6 +329,20 @@ func (c *Config) ResolveModel(in string) string {
 		return c.DefaultModel
 	}
 	return DefaultDefaultModel
+}
+
+// ResolveThinkingBudgetMapping returns the first budget mapping that matches
+// the target model id. Provider prefixes are stripped before matching.
+func (c *Config) ResolveThinkingBudgetMapping(model string) (ThinkingBudgetMapping, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	bare := stripProviderPrefix(model)
+	for _, m := range c.ThinkingBudgetMappings {
+		if m.Match == "*" || strings.HasPrefix(model, m.Match) || strings.HasPrefix(bare, m.Match) {
+			return m, true
+		}
+	}
+	return ThinkingBudgetMapping{}, false
 }
 
 // stripProviderPrefix removes a leading "provider/" segment that clients add.
@@ -373,5 +419,8 @@ func (c *Config) ApplyPatch(src *Patch) {
 	}
 	if src.PromptCacheNormalize != nil {
 		c.PromptCacheNormalize = *src.PromptCacheNormalize
+	}
+	if src.ThinkingBudgetMappings != nil {
+		c.ThinkingBudgetMappings = append([]ThinkingBudgetMapping(nil), (*src.ThinkingBudgetMappings)...)
 	}
 }

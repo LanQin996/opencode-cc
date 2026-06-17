@@ -153,7 +153,7 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
 		"time":    time.Now().Format(time.RFC3339),
-		"version": "1.2.3",
+		"version": "1.2.5",
 	})
 }
 
@@ -306,6 +306,7 @@ func publicConfig(c *config.Config) map[string]any {
 		"prompt_cache_key_prefix":        c.PromptCacheKeyPrefix,
 		"prompt_cache_anthropic_control": c.PromptCacheAnthropicControl,
 		"prompt_cache_normalize":         c.PromptCacheNormalize,
+		"thinking_budget_mappings":       c.ThinkingBudgetMappings,
 	}
 }
 

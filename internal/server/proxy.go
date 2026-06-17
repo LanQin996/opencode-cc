@@ -56,6 +56,7 @@ func (s *Server) Proxy() http.HandlerFunc {
 		}
 
 		oreq := proxy.ConvertRequest(&areq, func(string) string { return targetModel })
+		applyThinkingBudgetMapping(oreq, &areq, targetModel, cfg)
 		proxy.ApplyOpenAIPromptCache(oreq, promptCacheOptionsFromConfig(cfg))
 
 		// Marshal the upstream request.

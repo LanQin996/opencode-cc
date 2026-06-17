@@ -141,6 +141,38 @@ func TestConfigPatchUpdatesPromptCache(t *testing.T) {
 	}
 }
 
+func TestConfigPatchUpdatesThinkingBudgetMappings(t *testing.T) {
+	cfg := config.Default()
+	mux := newTestAPI(t, cfg)
+
+	body := bytes.NewBufferString(`{
+		"thinking_budget_mappings":[
+			{"match":"deepseek-","field":"reasoning_effort"},
+			{"match":"kimi-","field":"thinking_budget","low":512,"medium":2048,"high":8192,"max":32768}
+		]
+	}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/config", body)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	snap := cfg.Snapshot()
+	if len(snap.ThinkingBudgetMappings) != 2 ||
+		snap.ThinkingBudgetMappings[0].Field != "reasoning_effort" ||
+		snap.ThinkingBudgetMappings[1].Max != 32768 {
+		t.Fatalf("thinking budget config was not updated: %+v", snap.ThinkingBudgetMappings)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if _, ok := out["thinking_budget_mappings"]; !ok {
+		t.Fatalf("thinking budget mappings missing from public config: %s", rec.Body.String())
+	}
+}
+
 func TestPanelTokenChangeInvalidatesSessions(t *testing.T) {
 	invalidateSessions()
 	t.Cleanup(invalidateSessions)

@@ -71,6 +71,14 @@ export interface PanelConfig {
   prompt_cache_key_prefix: string;
   prompt_cache_anthropic_control: boolean;
   prompt_cache_normalize: boolean;
+  thinking_budget_mappings: {
+    match: string;
+    field: string;
+    low?: number;
+    medium?: number;
+    high?: number;
+    max?: number;
+  }[];
 }
 
 export interface TestResult {

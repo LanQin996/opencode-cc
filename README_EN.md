@@ -248,6 +248,12 @@ This compatibility layer runs locally in the proxy and does not require a native
     { "match": "claude-sonnet-4-5", "target": "glm-5.1" },
     { "match": "*", "target": "" }  // Pass-through fallback
   ],
+  "thinking_budget_mappings": [
+    // Map Claude Code thinking budget_tokens to model-supported OpenAI extension fields
+    { "match": "glm-", "field": "thinking" },
+    { "match": "kimi-", "field": "thinking_budget", "low": 1024, "medium": 4096, "high": 8192, "max": 16384 },
+    { "match": "moonshot-", "field": "thinking_budget", "low": 1024, "medium": 4096, "high": 8192, "max": 16384 }
+  ],
   "log_requests": true,
   "request_timeout_seconds": 0
 }
@@ -256,6 +262,13 @@ This compatibility layer runs locally in the proxy and does not require a native
 Every field can be edited from the **Config** tab. Saving persists the configuration and hot-reloads the bridge by
 rebuilding the upstream client, with no restart required. Model strings without a mapping are forwarded to Zen
 unchanged.
+
+When an OpenAI-compatible reasoning model returns `reasoning_content`, the proxy converts it into an Anthropic
+`thinking` block and replays it as `reasoning_content` on the next upstream request. This satisfies thinking-mode
+continuation requirements for models such as DeepSeek and GLM. `thinking_budget_mappings` only adds thinking controls
+for explicitly matched models: GLM sends `thinking:{"type":"enabled","clear_thinking":false}` by default, Kimi/Moonshot
+send `thinking_budget` by default, and DeepSeek does not receive `thinking_budget`, avoiding incompatible provider
+parameters.
 
 ## API Endpoints
 

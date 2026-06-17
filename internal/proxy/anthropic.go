@@ -17,6 +17,7 @@ type AnthropicRequest struct {
 	Stream      bool                `json:"stream,omitempty"`
 	Tools       []AnthropicTool     `json:"tools,omitempty"`
 	ToolChoice  AnthropicToolChoice `json:"tool_choice,omitempty"`
+	Thinking    *AnthropicThinking  `json:"thinking,omitempty"`
 	// Metadata and other rarely-used fields are ignored.
 }
 
@@ -36,6 +37,7 @@ func (r AnthropicRequest) MarshalJSON() ([]byte, error) {
 		Stream      bool                 `json:"stream,omitempty"`
 		Tools       []AnthropicTool      `json:"tools,omitempty"`
 		ToolChoice  *AnthropicToolChoice `json:"tool_choice,omitempty"`
+		Thinking    *AnthropicThinking   `json:"thinking,omitempty"`
 	}
 	out := request{
 		Model:       r.Model,
@@ -47,6 +49,7 @@ func (r AnthropicRequest) MarshalJSON() ([]byte, error) {
 		Stop:        r.Stop,
 		Stream:      r.Stream,
 		Tools:       r.Tools,
+		Thinking:    r.Thinking,
 	}
 	if len(r.System.Blocks) > 0 {
 		out.System = &r.System
@@ -189,6 +192,13 @@ type AnthropicToolChoice struct {
 	Type string `json:"type"`
 	Name string `json:"name,omitempty"`
 	// disable_parallel_tools is ignored.
+}
+
+// AnthropicThinking is the top-level extended-thinking request option sent by
+// Claude Code when the user enables thinking.
+type AnthropicThinking struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
 }
 
 // ---- Non-streaming response ----

@@ -17,6 +17,15 @@ type OpenAIRequest struct {
 	ToolChoice        any                  `json:"tool_choice,omitempty"`
 	ParallelToolCalls *bool                `json:"parallel_tool_calls,omitempty"`
 	PromptCacheKey    string               `json:"prompt_cache_key,omitempty"`
+	ReasoningEffort   string               `json:"reasoning_effort,omitempty"`
+	ThinkingBudget    *int                 `json:"thinking_budget,omitempty"`
+	Thinking          *OpenAIThinking      `json:"thinking,omitempty"`
+}
+
+// OpenAIThinking carries provider-specific thinking controls used by GLM.
+type OpenAIThinking struct {
+	Type          string `json:"type"`
+	ClearThinking *bool  `json:"clear_thinking,omitempty"`
 }
 
 // OpenAIStreamOptions asks the upstream to include usage in the final chunk.

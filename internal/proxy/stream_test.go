@@ -173,6 +173,90 @@ func TestNonStreamConversion(t *testing.T) {
 	}
 }
 
+func TestReasoningContentRoundTripsAsThinking(t *testing.T) {
+	up := &OpenAIResponse{
+		ID: "chatcmpl-reasoning",
+		Choices: []OpenAIChoice{{
+			Message: &OpenAIMessage{
+				Role:             "assistant",
+				ReasoningContent: "hidden chain state",
+				Content:          "visible answer",
+			},
+			FinishReason: strPtr("stop"),
+		}},
+	}
+	resp := ConvertResponse(up, "claude-test")
+	if len(resp.Content) != 2 {
+		t.Fatalf("content blocks = %+v, want thinking + text", resp.Content)
+	}
+	if resp.Content[0].Type != "thinking" || resp.Content[0].Thinking != "hidden chain state" {
+		t.Fatalf("thinking block was not preserved: %+v", resp.Content[0])
+	}
+	if resp.Content[1].Type != "text" || resp.Content[1].Text != "visible answer" {
+		t.Fatalf("text block mismatch: %+v", resp.Content[1])
+	}
+
+	req := ConvertRequest(&AnthropicRequest{
+		Model:     "deepseek-v4-flash",
+		MaxTokens: 128,
+		Messages: []AnthropicMessage{{
+			Role: "assistant",
+			Content: AnthropicMessageContent{Blocks: []AnthropicContent{
+				{Type: "thinking", Thinking: "hidden chain state"},
+				{Type: "text", Text: "visible answer"},
+			}},
+		}},
+	}, func(model string) string { return model })
+	if len(req.Messages) != 1 {
+		t.Fatalf("messages = %+v", req.Messages)
+	}
+	if req.Messages[0].ReasoningContent != "hidden chain state" {
+		t.Fatalf("reasoning_content = %q", req.Messages[0].ReasoningContent)
+	}
+	if req.Messages[0].Content != "visible answer" {
+		t.Fatalf("content = %q", req.Messages[0].Content)
+	}
+}
+
+func TestStreamConversionPreservesReasoningContent(t *testing.T) {
+	var out bytes.Buffer
+	conv, err := NewStreamConverter(&out, "claude-test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.HandleChunk(&OpenAIStreamChunk{Choices: []OpenAIChoice{{
+		Delta: OpenAIDelta{ReasoningContent: "think first"},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.HandleChunk(&OpenAIStreamChunk{Choices: []OpenAIChoice{{
+		Delta: OpenAIDelta{Content: "then answer"},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.Finalize("end_turn"); err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := out.String()
+	for _, want := range []string{
+		`"content_block":{"type":"thinking","thinking":""}`,
+		`"delta":{"type":"thinking_delta","thinking":"think first"}`,
+		`"content_block":{"type":"text","text":""}`,
+		`"delta":{"type":"text_delta","text":"then answer"}`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q\n---OUTPUT---\n%s", want, got)
+		}
+	}
+	if strings.Index(got, `"type":"thinking"`) > strings.Index(got, `"type":"text"`) {
+		t.Fatalf("thinking block should precede text block:\n%s", got)
+	}
+}
+
 // TestRequestConversion checks tool_use/tool_result round trip in requests.
 func TestRequestConversion(t *testing.T) {
 	in := &AnthropicRequest{

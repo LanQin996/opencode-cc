@@ -156,9 +156,12 @@ func convertAssistantBlocks(m AnthropicMessage) []OpenAIMessage {
 				},
 			})
 		case "thinking":
-			// Drop thinking blocks; OpenAI chat has no equivalent and they are
-			// internal reasoning the user shouldn't replay into the model.
-			continue
+			// Reasoning-capable OpenAI-compatible providers such as DeepSeek
+			// require their previous reasoning_content to be replayed on the
+			// assistant message. Claude Code sends that back as an Anthropic
+			// thinking block, so preserve it structurally instead of emitting it
+			// as user-visible text.
+			msg.ReasoningContent += thinkingText(b)
 		default:
 			parts = append(parts, OpenAIContentPart{Type: "text", Text: b.Text})
 			hasText = true
@@ -177,6 +180,13 @@ func convertAssistantBlocks(m AnthropicMessage) []OpenAIMessage {
 	}
 	msg.ToolCalls = toolCalls
 	return []OpenAIMessage{msg}
+}
+
+func thinkingText(b AnthropicContent) string {
+	if b.Thinking != "" {
+		return b.Thinking
+	}
+	return b.Text
 }
 
 // convertUserBlocks handles user messages. tool_result blocks become standalone

@@ -615,14 +615,22 @@ type ResponsesResponse struct {
 
 // ResponsesOutputItem is either an assistant message or function call.
 type ResponsesOutputItem struct {
-	ID        string                 `json:"id"`
-	Type      string                 `json:"type"`
-	Status    string                 `json:"status,omitempty"`
-	Role      string                 `json:"role,omitempty"`
-	Content   []ResponsesContentPart `json:"content,omitempty"`
-	CallID    string                 `json:"call_id,omitempty"`
-	Name      string                 `json:"name,omitempty"`
-	Arguments string                 `json:"arguments,omitempty"`
+	ID        string                      `json:"id"`
+	Type      string                      `json:"type"`
+	Status    string                      `json:"status,omitempty"`
+	Role      string                      `json:"role,omitempty"`
+	Content   []ResponsesContentPart      `json:"content,omitempty"`
+	Summary   []ResponsesReasoningSummary `json:"summary,omitempty"`
+	CallID    string                      `json:"call_id,omitempty"`
+	Name      string                      `json:"name,omitempty"`
+	Arguments string                      `json:"arguments,omitempty"`
+}
+
+// ResponsesReasoningSummary is the displayable reasoning summary item used by
+// Responses-compatible clients.
+type ResponsesReasoningSummary struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 // ResponsesContentPart is an output_text part.
@@ -663,6 +671,9 @@ func ConvertResponsesResponse(in *OpenAIResponse, requestModel string) *Response
 	}
 	choice := in.Choices[0]
 	message := choice.Message
+	if message.ReasoningContent != "" {
+		out.Output = append(out.Output, completedReasoningItem("rs_"+randHex(24), message.ReasoningContent))
+	}
 	if text := messageContentString(message); text != "" {
 		out.Output = append(out.Output, completedMessageItem("msg_"+randHex(24), text))
 	}
@@ -780,6 +791,18 @@ func completedMessageItem(id, text string) ResponsesOutputItem {
 	}
 }
 
+func completedReasoningItem(id, text string) ResponsesOutputItem {
+	return ResponsesOutputItem{
+		ID:     id,
+		Type:   "reasoning",
+		Status: "completed",
+		Summary: []ResponsesReasoningSummary{{
+			Type: "summary_text",
+			Text: text,
+		}},
+	}
+}
+
 func responsesUsage(usage OpenAIUsage) *ResponsesUsage {
 	total := usage.TotalTokens
 	if total == 0 {
@@ -812,6 +835,12 @@ type responsesTextState struct {
 	text        strings.Builder
 }
 
+type responsesReasoningState struct {
+	id          string
+	outputIndex int
+	text        strings.Builder
+}
+
 type responsesToolState struct {
 	item        ResponsesOutputItem
 	outputIndex int
@@ -827,9 +856,10 @@ type ResponsesStreamConverter struct {
 	sequence  int
 	nextIndex int
 
-	text  *responsesTextState
-	tools map[int]*responsesToolState
-	order []int
+	reasoning *responsesReasoningState
+	text      *responsesTextState
+	tools     map[int]*responsesToolState
+	order     []int
 
 	inputTokens       int
 	outputTokens      int
@@ -873,6 +903,11 @@ func (c *ResponsesStreamConverter) HandleChunk(chunk *OpenAIStreamChunk) error {
 		c.cachedInputTokens = chunk.Usage.CachedPromptTokens()
 	}
 	for _, choice := range chunk.Choices {
+		if choice.Delta.ReasoningContent != "" {
+			if err := c.handleReasoning(choice.Delta.ReasoningContent); err != nil {
+				return err
+			}
+		}
 		if choice.Delta.Content != "" {
 			if err := c.handleText(choice.Delta.Content); err != nil {
 				return err
@@ -893,6 +928,12 @@ func (c *ResponsesStreamConverter) HandleChunk(chunk *OpenAIStreamChunk) error {
 // HandleTextDelta feeds a native upstream text delta into the Responses stream.
 func (c *ResponsesStreamConverter) HandleTextDelta(delta string) error {
 	return c.handleText(delta)
+}
+
+// HandleReasoningDelta feeds a Chat Completions reasoning_content delta into
+// the Responses stream.
+func (c *ResponsesStreamConverter) HandleReasoningDelta(delta string) error {
+	return c.handleReasoning(delta)
 }
 
 // HandleFunctionCallDelta feeds a native upstream function-call delta into the
@@ -978,6 +1019,48 @@ func (c *ResponsesStreamConverter) handleText(delta string) error {
 	})
 }
 
+func (c *ResponsesStreamConverter) handleReasoning(delta string) error {
+	if c.reasoning == nil {
+		c.reasoning = &responsesReasoningState{
+			id:          "rs_" + randHex(24),
+			outputIndex: c.nextIndex,
+		}
+		c.nextIndex++
+		if err := c.writeEvent("response.output_item.added", map[string]any{
+			"type":         "response.output_item.added",
+			"output_index": c.reasoning.outputIndex,
+			"item": map[string]any{
+				"id":      c.reasoning.id,
+				"type":    "reasoning",
+				"status":  "in_progress",
+				"summary": []any{},
+			},
+		}); err != nil {
+			return err
+		}
+		if err := c.writeEvent("response.reasoning_summary_part.added", map[string]any{
+			"type":          "response.reasoning_summary_part.added",
+			"item_id":       c.reasoning.id,
+			"output_index":  c.reasoning.outputIndex,
+			"summary_index": 0,
+			"part": ResponsesReasoningSummary{
+				Type: "summary_text",
+				Text: "",
+			},
+		}); err != nil {
+			return err
+		}
+	}
+	c.reasoning.text.WriteString(delta)
+	return c.writeEvent("response.reasoning_summary_text.delta", map[string]any{
+		"type":          "response.reasoning_summary_text.delta",
+		"item_id":       c.reasoning.id,
+		"output_index":  c.reasoning.outputIndex,
+		"summary_index": 0,
+		"delta":         delta,
+	})
+}
+
 func (c *ResponsesStreamConverter) handleTool(tool OpenAIToolCall) error {
 	state := c.tools[tool.Index]
 	if state == nil {
@@ -1038,13 +1121,47 @@ func (c *ResponsesStreamConverter) Finalize() error {
 		return nil
 	}
 	c.finalized = true
-	if c.text == nil && len(c.tools) == 0 {
+	if c.reasoning == nil && c.text == nil && len(c.tools) == 0 {
 		if err := c.handleText(""); err != nil {
 			return err
 		}
 	}
 
 	output := make([]ResponsesOutputItem, c.nextIndex)
+	if c.reasoning != nil {
+		text := c.reasoning.text.String()
+		part := ResponsesReasoningSummary{
+			Type: "summary_text",
+			Text: text,
+		}
+		item := completedReasoningItem(c.reasoning.id, text)
+		output[c.reasoning.outputIndex] = item
+		if err := c.writeEvent("response.reasoning_summary_text.done", map[string]any{
+			"type":          "response.reasoning_summary_text.done",
+			"item_id":       c.reasoning.id,
+			"output_index":  c.reasoning.outputIndex,
+			"summary_index": 0,
+			"text":          text,
+		}); err != nil {
+			return err
+		}
+		if err := c.writeEvent("response.reasoning_summary_part.done", map[string]any{
+			"type":          "response.reasoning_summary_part.done",
+			"item_id":       c.reasoning.id,
+			"output_index":  c.reasoning.outputIndex,
+			"summary_index": 0,
+			"part":          part,
+		}); err != nil {
+			return err
+		}
+		if err := c.writeEvent("response.output_item.done", map[string]any{
+			"type":         "response.output_item.done",
+			"output_index": c.reasoning.outputIndex,
+			"item":         item,
+		}); err != nil {
+			return err
+		}
+	}
 	if c.text != nil {
 		text := c.text.text.String()
 		part := ResponsesContentPart{

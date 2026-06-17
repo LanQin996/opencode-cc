@@ -30,8 +30,13 @@ func ConvertResponse(in *OpenAIResponse, requestModel string) *AnthropicResponse
 
 	choice := in.Choices[0]
 	if choice.Message != nil {
-		// Text content — the model's actual reply. reasoning_content (the
-		// chain-of-thought of reasoning models) is ignored on purpose.
+		if choice.Message.ReasoningContent != "" {
+			out.Content = append(out.Content, AnthropicContent{
+				Type:     "thinking",
+				Thinking: choice.Message.ReasoningContent,
+			})
+		}
+		// Text content — the model's actual reply.
 		if txt := messageContentString(choice.Message); txt != "" {
 			out.Content = append(out.Content, AnthropicContent{Type: "text", Text: txt})
 		}

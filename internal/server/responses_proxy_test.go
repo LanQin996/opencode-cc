@@ -16,6 +16,10 @@ import (
 func TestResponsesNonStream(t *testing.T) {
 	var upstreamBody struct {
 		Model    string `json:"model"`
+		Thinking *struct {
+			Type          string `json:"type"`
+			ClearThinking *bool  `json:"clear_thinking"`
+		} `json:"thinking"`
 		Messages []struct {
 			Role    string `json:"role"`
 			Content any    `json:"content"`
@@ -54,6 +58,12 @@ func TestResponsesNonStream(t *testing.T) {
 	}
 	if upstreamBody.Model != "glm-5.1" {
 		t.Fatalf("mapped model = %q", upstreamBody.Model)
+	}
+	if upstreamBody.Thinking == nil ||
+		upstreamBody.Thinking.Type != "enabled" ||
+		upstreamBody.Thinking.ClearThinking == nil ||
+		*upstreamBody.Thinking.ClearThinking {
+		t.Fatalf("GLM thinking object not applied: %+v", upstreamBody.Thinking)
 	}
 	if len(upstreamBody.Messages) != 2 || upstreamBody.Messages[0].Role != "system" {
 		t.Fatalf("upstream messages = %+v", upstreamBody.Messages)

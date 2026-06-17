@@ -45,11 +45,12 @@ type streamContentBlockStart struct {
 // streamContentRef is the minimal block description sent on block start. For
 // tool_use we send {type,id,name,input:{}}; the body comes via input_json_delta.
 type streamContentRef struct {
-	Type  string         `json:"type"`
-	Text  string         `json:"text,omitempty"`
-	ID    string         `json:"id,omitempty"`
-	Name  string         `json:"name,omitempty"`
-	Input jsonRawMessage `json:"input,omitempty"`
+	Type     string         `json:"type"`
+	Text     *string        `json:"text,omitempty"`
+	Thinking *string        `json:"thinking,omitempty"`
+	ID       string         `json:"id,omitempty"`
+	Name     string         `json:"name,omitempty"`
+	Input    jsonRawMessage `json:"input,omitempty"`
 }
 
 type streamContentBlockDelta struct {
@@ -62,6 +63,7 @@ type streamContentBlockDelta struct {
 type streamDelta struct {
 	Type        string `json:"type"`
 	Text        string `json:"text,omitempty"`
+	Thinking    string `json:"thinking,omitempty"`
 	PartialJSON string `json:"partial_json,omitempty"`
 }
 
@@ -105,7 +107,7 @@ type streamErrorEvent struct {
 // content_block_stop when it changes or ends.
 type blockState struct {
 	index  int
-	kind   string // "text" | "tool_use"
+	kind   string // "text" | "thinking" | "tool_use"
 	toolid string
 }
 
@@ -198,17 +200,21 @@ func (c *StreamConverter) HandleChunk(chunk *OpenAIStreamChunk) error {
 	}
 
 	for _, ch := range chunk.Choices {
-		// 1. Text delta — this is the model's actual reply.
+		// 1. reasoning_content is provider-required hidden thinking state.
+		// Emit it as an Anthropic thinking block so Claude Code can replay it
+		// on the next request without mixing it into user-visible text.
+		if ch.Delta.ReasoningContent != "" {
+			if err := c.handleThinking(ch.Delta.ReasoningContent); err != nil {
+				return err
+			}
+		}
+		// 2. Text delta — this is the model's actual reply.
 		if ch.Delta.Content != "" {
 			if err := c.handleText(ch.Delta.Content); err != nil {
 				return err
 			}
 		}
-		// 1b. "reasoning_content" is the chain-of-thought of reasoning models
-		// (GLM, Kimi, DeepSeek). We deliberately DROP it: emitting it as text
-		// would flood Claude Code's agent loop with internal scratchpad tokens
-		// and pollute tool-call parsing, yielding empty/broken replies.
-		// 2. Tool call deltas.
+		// 3. Tool call deltas.
 		for _, tc := range ch.Delta.ToolCalls {
 			if !c.toolAllowed(tc.Function.Name) {
 				continue
@@ -217,17 +223,40 @@ func (c *StreamConverter) HandleChunk(chunk *OpenAIStreamChunk) error {
 				return err
 			}
 		}
-		// 3. Role-only first delta (no content) — nothing to emit.
+		// 4. Role-only first delta (no content) — nothing to emit.
 		if ch.Delta.Role != "" && ch.Delta.Content == "" && len(ch.Delta.ToolCalls) == 0 {
 			continue
 		}
-		// 4. Finish reason — remember it; we finalize at stream end so the
+		// 5. Finish reason — remember it; we finalize at stream end so the
 		// trailing usage chunk (if any) is captured.
 		if ch.FinishReason != nil {
 			c.pendingFinish = *ch.FinishReason
 		}
 	}
 	return nil
+}
+
+func (c *StreamConverter) handleThinking(text string) error {
+	if c.cur == nil || c.cur.kind != "thinking" {
+		if err := c.closeCurrent(); err != nil {
+			return err
+		}
+		idx := c.nextIdx
+		c.nextIdx++
+		c.cur = &blockState{index: idx, kind: "thinking"}
+		if err := c.writeEvent("content_block_start", streamContentBlockStart{
+			Type:         "content_block_start",
+			Index:        idx,
+			ContentBlock: streamContentRef{Type: "thinking", Thinking: stringRef("")},
+		}); err != nil {
+			return err
+		}
+	}
+	return c.writeEvent("content_block_delta", streamContentBlockDelta{
+		Type:  "content_block_delta",
+		Index: c.cur.index,
+		Delta: streamDelta{Type: "thinking_delta", Thinking: text},
+	})
 }
 
 // handleText emits text_delta events, opening a text block if needed.
@@ -242,7 +271,7 @@ func (c *StreamConverter) handleText(text string) error {
 		if err := c.writeEvent("content_block_start", streamContentBlockStart{
 			Type:         "content_block_start",
 			Index:        idx,
-			ContentBlock: streamContentRef{Type: "text", Text: ""},
+			ContentBlock: streamContentRef{Type: "text", Text: stringRef("")},
 		}); err != nil {
 			return err
 		}
@@ -252,6 +281,10 @@ func (c *StreamConverter) handleText(text string) error {
 		Index: c.cur.index,
 		Delta: streamDelta{Type: "text_delta", Text: text},
 	})
+}
+
+func stringRef(s string) *string {
+	return &s
 }
 
 // handleToolCall opens a tool_use block on first sight of a tool call id, then

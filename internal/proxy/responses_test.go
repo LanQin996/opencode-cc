@@ -319,6 +319,35 @@ func TestConvertResponsesResponse(t *testing.T) {
 	}
 }
 
+func TestConvertResponsesResponsePreservesReasoningContent(t *testing.T) {
+	in := &OpenAIResponse{
+		ID: "chatcmpl-reasoning",
+		Choices: []OpenAIChoice{{
+			Index: 0,
+			Message: &OpenAIMessage{
+				Role:             "assistant",
+				ReasoningContent: "think it through",
+				Content:          "done",
+			},
+			FinishReason: strPtr("stop"),
+		}},
+		Usage: OpenAIUsage{PromptTokens: 4, CompletionTokens: 3, TotalTokens: 7},
+	}
+
+	out := ConvertResponsesResponse(in, "client-model")
+	if len(out.Output) != 2 {
+		t.Fatalf("output = %+v", out.Output)
+	}
+	if out.Output[0].Type != "reasoning" ||
+		len(out.Output[0].Summary) != 1 ||
+		out.Output[0].Summary[0].Text != "think it through" {
+		t.Fatalf("reasoning output = %+v", out.Output[0])
+	}
+	if out.Output[1].Type != "message" || out.Output[1].Content[0].Text != "done" {
+		t.Fatalf("message output = %+v", out.Output[1])
+	}
+}
+
 func TestConvertAnthropicResponseToResponses(t *testing.T) {
 	stop := "tool_use"
 	in := &AnthropicResponse{
@@ -439,5 +468,49 @@ func TestResponsesStreamConverterTextAndTool(t *testing.T) {
 		if _, ok := event["sequence_number"]; !ok {
 			t.Fatalf("event has no sequence_number: %v", event)
 		}
+	}
+}
+
+func TestResponsesStreamConverterReasoningContent(t *testing.T) {
+	var stream strings.Builder
+	converter, err := NewResponsesStreamConverter(&stream, "client-model")
+	if err != nil {
+		t.Fatalf("new converter: %v", err)
+	}
+	if err := converter.HandleChunk(&OpenAIStreamChunk{
+		Choices: []OpenAIChoice{{
+			Delta: OpenAIDelta{ReasoningContent: "first think"},
+		}},
+	}); err != nil {
+		t.Fatalf("reasoning chunk: %v", err)
+	}
+	if err := converter.HandleChunk(&OpenAIStreamChunk{
+		Choices: []OpenAIChoice{{
+			Delta: OpenAIDelta{Content: "then answer"},
+		}},
+		Usage: &OpenAIUsage{PromptTokens: 9, CompletionTokens: 4, TotalTokens: 13},
+	}); err != nil {
+		t.Fatalf("text chunk: %v", err)
+	}
+	if err := converter.Finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+
+	out := stream.String()
+	for _, want := range []string{
+		"event: response.reasoning_summary_part.added",
+		"event: response.reasoning_summary_text.delta",
+		`"delta":"first think"`,
+		"event: response.reasoning_summary_text.done",
+		`"type":"reasoning"`,
+		`"summary":[{"type":"summary_text","text":"first think"}]`,
+		`"delta":"then answer"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stream missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Index(out, "response.reasoning_summary_text.delta") > strings.Index(out, "response.output_text.delta") {
+		t.Fatalf("reasoning should be emitted before text:\n%s", out)
 	}
 }

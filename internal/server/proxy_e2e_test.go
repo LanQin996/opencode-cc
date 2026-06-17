@@ -129,6 +129,197 @@ func TestProxyNonStreamEndToEnd(t *testing.T) {
 	}
 }
 
+func TestProxyReplaysReasoningContentOnFollowup(t *testing.T) {
+	var calls int
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var upstreamReq struct {
+			Messages []struct {
+				Role             string `json:"role"`
+				ReasoningContent string `json:"reasoning_content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if calls == 2 {
+			found := false
+			for _, msg := range upstreamReq.Messages {
+				if msg.Role == "assistant" && msg.ReasoningContent == "deepseek hidden state" {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("follow-up request did not replay reasoning_content: %+v", upstreamReq.Messages)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"chatcmpl-reasoning",
+			"choices":[{"index":0,"message":{"role":"assistant","reasoning_content":"deepseek hidden state","content":"visible answer"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":6,"completion_tokens":3,"total_tokens":9}
+		}`)
+	}))
+	defer zen.Close()
+	srv, _ := newTestServer(t, zen.URL)
+	srv.cfg.ModelMappings = []config.ModelMapping{{Match: "*", Target: ""}}
+
+	firstBody := []byte(`{
+		"model":"deepseek-v4-flash",
+		"max_tokens":256,
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(firstBody))
+	firstRec := httptest.NewRecorder()
+	srv.Proxy().ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first status %d: %s", firstRec.Code, firstRec.Body.String())
+	}
+	var firstResp proxy.AnthropicResponse
+	if err := json.Unmarshal(firstRec.Body.Bytes(), &firstResp); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	if len(firstResp.Content) < 2 ||
+		firstResp.Content[0].Type != "thinking" ||
+		firstResp.Content[0].Thinking != "deepseek hidden state" {
+		t.Fatalf("first response did not expose thinking block for replay: %+v", firstResp.Content)
+	}
+
+	secondBody, _ := json.Marshal(map[string]any{
+		"model":      "deepseek-v4-flash",
+		"max_tokens": 256,
+		"messages": []map[string]any{
+			{"role": "user", "content": "hi"},
+			{"role": "assistant", "content": []map[string]any{
+				{"type": "thinking", "thinking": firstResp.Content[0].Thinking},
+				{"type": "text", "text": firstResp.Content[1].Text},
+			}},
+			{"role": "user", "content": "continue"},
+		},
+	})
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(secondBody))
+	secondRec := httptest.NewRecorder()
+	srv.Proxy().ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusOK {
+		t.Fatalf("second status %d: %s", secondRec.Code, secondRec.Body.String())
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls)
+	}
+}
+
+func TestProxyAppliesThinkingBudgetMappingForKimi(t *testing.T) {
+	var got struct {
+		Model           string `json:"model"`
+		ThinkingBudget  *int   `json:"thinking_budget"`
+		ReasoningEffort string `json:"reasoning_effort"`
+	}
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"chatcmpl-kimi",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
+		}`)
+	}))
+	defer zen.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamBase = zen.URL
+	cfg.ZenAPIKey = "test-key"
+	cfg.NativeAnthropic = false
+	cfg.ModelMappings = []config.ModelMapping{{Match: "*", Target: ""}}
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	srv := New(cfg, st)
+
+	body := []byte(`{
+		"model":"anthropic/kimi-k2.7-code",
+		"max_tokens":256,
+		"thinking":{"type":"enabled","budget_tokens":20000},
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Proxy().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got.Model != "kimi-k2.7-code" {
+		t.Fatalf("model = %q, want kimi-k2.7-code", got.Model)
+	}
+	if got.ThinkingBudget == nil || *got.ThinkingBudget != 16384 {
+		t.Fatalf("thinking_budget = %v, want 16384", got.ThinkingBudget)
+	}
+	if got.ReasoningEffort != "" {
+		t.Fatalf("reasoning_effort should not be set for Kimi mapping: %q", got.ReasoningEffort)
+	}
+}
+
+func TestProxyAppliesThinkingObjectForGLM(t *testing.T) {
+	var got struct {
+		Model    string `json:"model"`
+		Thinking *struct {
+			Type          string `json:"type"`
+			ClearThinking *bool  `json:"clear_thinking"`
+		} `json:"thinking"`
+	}
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"chatcmpl-glm",
+			"choices":[{"index":0,"message":{"role":"assistant","reasoning_content":"plan","content":"ok"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}
+		}`)
+	}))
+	defer zen.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamBase = zen.URL
+	cfg.ZenAPIKey = "test-key"
+	cfg.NativeAnthropic = false
+	cfg.ModelMappings = []config.ModelMapping{{Match: "*", Target: ""}}
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	srv := New(cfg, st)
+
+	body := []byte(`{
+		"model":"glm-5.2",
+		"max_tokens":256,
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Proxy().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got.Model != "glm-5.2" {
+		t.Fatalf("model = %q, want glm-5.2", got.Model)
+	}
+	if got.Thinking == nil ||
+		got.Thinking.Type != "enabled" ||
+		got.Thinking.ClearThinking == nil ||
+		*got.Thinking.ClearThinking {
+		t.Fatalf("thinking object was not applied for GLM: %+v", got.Thinking)
+	}
+	if !strings.Contains(rec.Body.String(), `"type":"thinking"`) {
+		t.Fatalf("reasoning_content was not returned as Anthropic thinking: %s", rec.Body.String())
+	}
+}
+
 func TestProxyStreamEndToEnd(t *testing.T) {
 	chunks := []string{
 		// role

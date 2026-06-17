@@ -76,3 +76,34 @@ func TestPromptCacheConfigPatch(t *testing.T) {
 		t.Fatalf("prompt cache patch/snapshot mismatch: %+v", snap)
 	}
 }
+
+func TestResolveThinkingBudgetMapping(t *testing.T) {
+	c := Default()
+
+	glmMapping, ok := c.ResolveThinkingBudgetMapping("openai/glm-5.2")
+	if !ok {
+		t.Fatal("expected default GLM thinking mapping")
+	}
+	if glmMapping.Field != "thinking" {
+		t.Fatalf("unexpected GLM mapping: %+v", glmMapping)
+	}
+
+	mapping, ok := c.ResolveThinkingBudgetMapping("anthropic/kimi-k2.7-code")
+	if !ok {
+		t.Fatal("expected default Kimi thinking budget mapping")
+	}
+	if mapping.Field != "thinking_budget" || mapping.Max != 16384 {
+		t.Fatalf("unexpected mapping: %+v", mapping)
+	}
+
+	if _, ok := c.ResolveThinkingBudgetMapping("deepseek-v4-flash"); ok {
+		t.Fatal("DeepSeek should not receive an explicit thinking budget field by default")
+	}
+
+	custom := []ThinkingBudgetMapping{{Match: "deepseek-", Field: "reasoning_effort"}}
+	c.ApplyPatch(&Patch{ThinkingBudgetMappings: &custom})
+	snap := c.Snapshot()
+	if len(snap.ThinkingBudgetMappings) != 1 || snap.ThinkingBudgetMappings[0].Field != "reasoning_effort" {
+		t.Fatalf("thinking budget patch/snapshot mismatch: %+v", snap.ThinkingBudgetMappings)
+	}
+}

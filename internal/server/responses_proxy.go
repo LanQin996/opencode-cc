@@ -59,6 +59,7 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
+		applyResponsesThinkingMapping(chatReq, targetModel, cfg)
 		proxy.ApplyOpenAIPromptCache(chatReq, promptCacheOptionsFromConfig(cfg))
 		upBody, err := json.Marshal(chatReq)
 		if err != nil {
