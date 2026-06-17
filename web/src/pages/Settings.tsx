@@ -7,10 +7,15 @@ export default function Settings() {
   const [cfg, setCfg] = useState<PanelConfig | null>(null);
   const [apiKey, setApiKey] = useState("");
   const [upstream, setUpstream] = useState("https://opencode.ai/zen");
+  const [nativeAnthropic, setNativeAnthropic] = useState(false);
   const [logReqs, setLogReqs] = useState(true);
   const [maxBody, setMaxBody] = useState(16384);
   const [timeout, setTimeoutSecs] = useState(0);
   const [requireKey, setRequireKey] = useState(false);
+  const [promptCache, setPromptCache] = useState(true);
+  const [promptCacheKeyPrefix, setPromptCacheKeyPrefix] = useState("opencode-cc");
+  const [promptCacheAnthropicControl, setPromptCacheAnthropicControl] = useState(true);
+  const [promptCacheNormalize, setPromptCacheNormalize] = useState(true);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [flash, setFlash] = useState("");
@@ -25,10 +30,15 @@ export default function Settings() {
     api.getConfig().then((c) => {
       setCfg(c);
       setUpstream(c.upstream_base);
+      setNativeAnthropic(c.native_anthropic);
       setLogReqs(c.log_requests);
       setMaxBody(c.max_body_log_bytes);
       setTimeoutSecs(c.request_timeout_seconds);
       setRequireKey(c.require_api_key);
+      setPromptCache(c.prompt_cache_enabled);
+      setPromptCacheKeyPrefix(c.prompt_cache_key_prefix || "opencode-cc");
+      setPromptCacheAnthropicControl(c.prompt_cache_anthropic_control);
+      setPromptCacheNormalize(c.prompt_cache_normalize);
     });
   }, []);
 
@@ -58,10 +68,15 @@ export default function Settings() {
     try {
       const body: Record<string, unknown> = {
         upstream_base: upstream,
+        native_anthropic: nativeAnthropic,
         log_requests: logReqs,
         max_body_log_bytes: maxBody,
         request_timeout_seconds: timeout,
         require_api_key: requireKey,
+        prompt_cache_enabled: promptCache,
+        prompt_cache_key_prefix: promptCacheKeyPrefix,
+        prompt_cache_anthropic_control: promptCacheAnthropicControl,
+        prompt_cache_normalize: promptCacheNormalize,
       };
       // Only send the API key if the user typed a new one.
       if (apiKey.trim()) body.zen_api_key = apiKey.trim();
@@ -137,7 +152,9 @@ export default function Settings() {
           }}
         />
         <p className="text-xs text-slate-500 mt-2">
-          请求会发送到 <span className="font-mono text-slate-400">{upstream.replace(/\/$/, "")}/v1/chat/completions</span>。
+          开启智能原生路由时，Claude/Qwen 目标模型会发送到{" "}
+          <span className="font-mono text-slate-400">{upstream.replace(/\/$/, "")}/v1/messages</span>
+          ，其它目标模型仍会走转换接口。
         </p>
       </Card>
 
@@ -148,14 +165,26 @@ export default function Settings() {
         </div>
 
         <Toggle
-          label="记录请求"
-          desc="为面板记录每个代理请求及其转换后的响应。"
-          checked={logReqs}
+          label="Anthropic 智能原生路由"
+          desc="开启后，仅 claude-* / qwen* 目标模型直连上游 /v1/messages；glm、deepseek、kimi 等其它目标模型继续走转换模式。"
+          checked={nativeAnthropic}
           onChange={(v) => {
-            setLogReqs(v);
+            setNativeAnthropic(v);
             setDirty(true);
           }}
         />
+
+        <div className="mt-4">
+          <Toggle
+            label="记录请求"
+            desc="为面板记录每个代理请求及其转换后的响应。"
+            checked={logReqs}
+            onChange={(v) => {
+              setLogReqs(v);
+              setDirty(true);
+            }}
+          />
+        </div>
 
         <div className="mt-4">
           <Toggle
@@ -168,6 +197,13 @@ export default function Settings() {
             }}
           />
         </div>
+
+        {nativeAnthropic && (
+          <p className="mt-3 rounded-xl border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-xs text-amber-100">
+            请确认当前上游 Base URL 对 Claude/Qwen 模型支持 <span className="font-mono">/v1/messages</span>。
+            非 Anthropic 原生目标模型不会走这条直连路径。
+          </p>
+        )}
 
         <div className="grid grid-cols-2 gap-4 mt-4">
           <div>
@@ -196,6 +232,63 @@ export default function Settings() {
               }}
             />
           </div>
+        </div>
+      </Card>
+
+      <Card className="mb-4">
+        <div className="flex items-center gap-2 mb-4">
+          <CacheIcon />
+          <h3 className="text-sm font-semibold text-slate-200">Prompt Cache 优化</h3>
+          {promptCache ? <Badge tone="green">已开启</Badge> : <Badge tone="amber">已关闭</Badge>}
+        </div>
+
+        <Toggle
+          label="启用缓存友好化"
+          desc="自动添加 prompt_cache_key，并稳定工具、system/developer 前缀和相邻文件上下文顺序。"
+          checked={promptCache}
+          onChange={(v) => {
+            setPromptCache(v);
+            setDirty(true);
+          }}
+        />
+
+        <div className="mt-4">
+          <label className="label">prompt_cache_key 前缀</label>
+          <input
+            className="input font-mono"
+            value={promptCacheKeyPrefix}
+            onChange={(e) => {
+              setPromptCacheKeyPrefix(e.target.value);
+              setDirty(true);
+            }}
+          />
+          <p className="text-xs text-slate-500 mt-2">
+            代理会基于模型、工具集和稳定 system 前缀生成 key；这里的前缀用于区分不同代理实例。
+          </p>
+        </div>
+
+        <div className="mt-4">
+          <Toggle
+            label="Anthropic 自动 cache_control"
+            desc="原生 Anthropic 上游请求中，如果有稳定 system/tool 前缀但没有 cache_control，则自动添加 ephemeral 缓存断点。"
+            checked={promptCacheAnthropicControl}
+            onChange={(v) => {
+              setPromptCacheAnthropicControl(v);
+              setDirty(true);
+            }}
+          />
+        </div>
+
+        <div className="mt-4">
+          <Toggle
+            label="归一化缓存前缀"
+            desc="移除 request_id/timestamp 等非 prompt 噪声字段，并固定工具、system/developer、文件上下文顺序。"
+            checked={promptCacheNormalize}
+            onChange={(v) => {
+              setPromptCacheNormalize(v);
+              setDirty(true);
+            }}
+          />
         </div>
       </Card>
 
@@ -345,6 +438,16 @@ function LockIcon() {
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-slate-500">
       <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
       <path d="M7 11V7a5 5 0 0 1 10 0v4" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function CacheIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-slate-500">
+      <ellipse cx="12" cy="5" rx="8" ry="3" />
+      <path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5" />
+      <path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6" />
     </svg>
   );
 }

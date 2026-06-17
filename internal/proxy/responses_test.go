@@ -18,6 +18,7 @@ func TestConvertResponsesRequestForCodex(t *testing.T) {
 		],
 		"tools":[
 			{"type":"function","name":"shell_command","description":"Run a command","parameters":{"type":"object","properties":{"command":{"type":"string"}}}},
+			{"type":"function","name":"apply_patch","description":"Patch files","parameters":{"type":"object"}},
 			{"type":"web_search"}
 		],
 		"tool_choice":"auto",
@@ -42,7 +43,9 @@ func TestConvertResponsesRequestForCodex(t *testing.T) {
 	if out.ParallelToolCalls == nil || *out.ParallelToolCalls {
 		t.Fatalf("parallel_tool_calls = %v, want false", out.ParallelToolCalls)
 	}
-	if len(out.Tools) != 1 || out.Tools[0].Function.Name != "shell_command" {
+	if len(out.Tools) != 2 ||
+		out.Tools[0].Function.Name != "apply_patch" ||
+		out.Tools[1].Function.Name != "shell_command" {
 		t.Fatalf("function tools = %+v", out.Tools)
 	}
 	if len(out.Messages) != 5 {
@@ -59,6 +62,219 @@ func TestConvertResponsesRequestForCodex(t *testing.T) {
 	}
 	if out.Messages[4].Role != "tool" || out.Messages[4].ToolCallID != "call_123" {
 		t.Fatalf("function output message = %+v", out.Messages[4])
+	}
+}
+
+func TestConvertResponsesToAnthropicRequestForCodex(t *testing.T) {
+	body := []byte(`{
+		"model":"client-model",
+		"instructions":"You are a coding agent.",
+		"input":[
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"Use PowerShell."}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Inspect the repo."}]},
+			{"type":"function_call","call_id":"call_123","name":"shell_command","arguments":"{\"command\":\"Get-ChildItem\"}"},
+			{"type":"function_call_output","call_id":"call_123","output":"README.md"}
+		],
+		"tools":[
+			{"type":"function","name":"z_shell","description":"Late tool","parameters":{"type":"object"}},
+			{"type":"function","name":"shell_command","description":"Run a command","parameters":{"properties":{"command":{"type":"string"}}}}
+		],
+		"tool_choice":{"type":"function","name":"shell_command"},
+		"max_output_tokens":256,
+		"stream":true
+	}`)
+	req, err := ParseResponsesRequest(body)
+	if err != nil {
+		t.Fatalf("parse request: %v", err)
+	}
+	out, err := ConvertResponsesToAnthropicRequest(req, func(string) string { return "claude-sonnet-4-5" })
+	if err != nil {
+		t.Fatalf("convert request: %v", err)
+	}
+
+	if out.Model != "claude-sonnet-4-5" || out.MaxTokens != 256 || !out.Stream {
+		t.Fatalf("unexpected request fields: %+v", out)
+	}
+	if len(out.System.Blocks) != 2 ||
+		out.System.Blocks[0].Text != "You are a coding agent." ||
+		out.System.Blocks[1].Text != "Use PowerShell." {
+		t.Fatalf("system blocks = %+v", out.System.Blocks)
+	}
+	if len(out.Messages) != 3 {
+		t.Fatalf("messages = %+v", out.Messages)
+	}
+	if out.Messages[1].Role != "assistant" ||
+		out.Messages[1].Content.Blocks[0].Type != "tool_use" ||
+		string(out.Messages[1].Content.Blocks[0].Input) != `{"command":"Get-ChildItem"}` {
+		t.Fatalf("tool_use message = %+v", out.Messages[1])
+	}
+	if out.Messages[2].Role != "user" ||
+		out.Messages[2].Content.Blocks[0].Type != "tool_result" {
+		t.Fatalf("tool_result message = %+v", out.Messages[2])
+	}
+	if len(out.Tools) != 2 ||
+		out.Tools[0].Name != "shell_command" ||
+		out.Tools[1].Name != "z_shell" ||
+		!strings.Contains(string(out.Tools[0].InputSchema), `"type":"object"`) {
+		t.Fatalf("tools = %+v", out.Tools)
+	}
+	if out.ToolChoice.Type != "tool" || out.ToolChoice.Name != "shell_command" {
+		t.Fatalf("tool_choice = %+v", out.ToolChoice)
+	}
+}
+
+func TestConvertRequestSortsTools(t *testing.T) {
+	req := &AnthropicRequest{
+		Model:     "client-model",
+		MaxTokens: 128,
+		Messages: []AnthropicMessage{{
+			Role: "user",
+			Content: AnthropicMessageContent{
+				IsStr: true,
+				Text:  "hi",
+			},
+		}},
+		Tools: []AnthropicTool{
+			{Name: "z_tool", InputSchema: json.RawMessage(`{"type":"object"}`)},
+			{Name: "a_tool", InputSchema: json.RawMessage(`{"type":"object"}`)},
+		},
+	}
+
+	out := ConvertRequest(req, func(string) string { return "target-model" })
+	if len(out.Tools) != 2 ||
+		out.Tools[0].Function.Name != "a_tool" ||
+		out.Tools[1].Function.Name != "z_tool" {
+		t.Fatalf("tools = %+v", out.Tools)
+	}
+}
+
+func TestResponsesDeveloperMessageMovesToSystemPrefix(t *testing.T) {
+	body := []byte(`{
+		"model":"client-model",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Question"}]},
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"Stable rules"}]}
+		]
+	}`)
+	req, err := ParseResponsesRequest(body)
+	if err != nil {
+		t.Fatalf("parse request: %v", err)
+	}
+	out, err := ConvertResponsesRequest(req, func(string) string { return "target-model" })
+	if err != nil {
+		t.Fatalf("convert request: %v", err)
+	}
+	if len(out.Messages) != 2 {
+		t.Fatalf("messages = %+v", out.Messages)
+	}
+	if out.Messages[0].Role != "system" || out.Messages[0].Content != "Stable rules" {
+		t.Fatalf("system prefix = %+v", out.Messages[0])
+	}
+	if out.Messages[1].Role != "user" || out.Messages[1].Content != "Question" {
+		t.Fatalf("user message = %+v", out.Messages[1])
+	}
+}
+
+func TestPromptCacheNormalizesRawOpenAIRequest(t *testing.T) {
+	payload := map[string]json.RawMessage{
+		"model":    json.RawMessage(`"target-model"`),
+		"metadata": json.RawMessage(`{"trace":"keep","request_id":"drop","timestamp":"drop"}`),
+		"tools": json.RawMessage(`[
+			{"type":"function","function":{"name":"z_tool","parameters":{"type":"object"}}},
+			{"type":"function","function":{"name":"a_tool","parameters":{"type":"object"}}}
+		]`),
+		"messages": json.RawMessage(`[
+			{"role":"user","content":[
+				{"type":"document","source":{"path":"b.md"}},
+				{"type":"document","source":{"path":"a.md"}},
+				{"type":"text","text":"Question"}
+			]},
+			{"role":"developer","content":"Stable rules"}
+		]`),
+	}
+
+	ApplyRawOpenAIPromptCache(payload, PromptCacheOptions{
+		Enabled:          true,
+		KeyPrefix:        "test",
+		NormalizePrompts: true,
+	})
+
+	var key string
+	if err := json.Unmarshal(payload["prompt_cache_key"], &key); err != nil || !strings.HasPrefix(key, "test:") {
+		t.Fatalf("prompt_cache_key = %q, err=%v", key, err)
+	}
+	var metadata map[string]json.RawMessage
+	if err := json.Unmarshal(payload["metadata"], &metadata); err != nil {
+		t.Fatalf("metadata: %v", err)
+	}
+	if _, ok := metadata["request_id"]; ok {
+		t.Fatalf("volatile metadata was preserved: %s", payload["metadata"])
+	}
+	if string(metadata["trace"]) != `"keep"` {
+		t.Fatalf("non-volatile metadata was changed: %s", payload["metadata"])
+	}
+	var tools []struct {
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(payload["tools"], &tools); err != nil {
+		t.Fatalf("tools: %v", err)
+	}
+	if tools[0].Function.Name != "a_tool" || tools[1].Function.Name != "z_tool" {
+		t.Fatalf("tools not sorted: %s", payload["tools"])
+	}
+	var messages []map[string]json.RawMessage
+	if err := json.Unmarshal(payload["messages"], &messages); err != nil {
+		t.Fatalf("messages: %v", err)
+	}
+	if rawString(messages[0]["role"]) != "developer" || rawString(messages[1]["role"]) != "user" {
+		t.Fatalf("system/developer prefix not moved: %s", payload["messages"])
+	}
+	var content []json.RawMessage
+	if err := json.Unmarshal(messages[1]["content"], &content); err != nil {
+		t.Fatalf("content: %v", err)
+	}
+	var firstDoc, secondDoc struct {
+		Source struct {
+			Path string `json:"path"`
+		} `json:"source"`
+	}
+	if err := json.Unmarshal(content[0], &firstDoc); err != nil {
+		t.Fatalf("first doc: %v", err)
+	}
+	if err := json.Unmarshal(content[1], &secondDoc); err != nil {
+		t.Fatalf("second doc: %v", err)
+	}
+	if firstDoc.Source.Path != "a.md" || secondDoc.Source.Path != "b.md" {
+		t.Fatalf("document context not sorted: %s", payload["messages"])
+	}
+}
+
+func TestPrepareAnthropicPromptCacheBodyAddsCacheControl(t *testing.T) {
+	out, err := PrepareAnthropicPromptCacheBody([]byte(`{
+		"model":"client-model",
+		"system":"Stable rules",
+		"messages":[{"role":"user","content":"hi"}],
+		"metadata":{"trace":"keep","request_id":"drop"}
+	}`), "claude-sonnet-4-5", PromptCacheOptions{
+		Enabled:               true,
+		AnthropicCacheControl: true,
+		NormalizePrompts:      true,
+	})
+	if err != nil {
+		t.Fatalf("prepare body: %v", err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if !strings.Contains(string(payload["system"]), `"cache_control"`) {
+		t.Fatalf("cache_control missing: %s", payload["system"])
+	}
+	if strings.Contains(string(payload["metadata"]), "request_id") ||
+		!strings.Contains(string(payload["metadata"]), "keep") {
+		t.Fatalf("metadata normalization failed: %s", payload["metadata"])
 	}
 }
 
@@ -99,6 +315,51 @@ func TestConvertResponsesResponse(t *testing.T) {
 		t.Fatalf("tool output = %+v", out.Output[1])
 	}
 	if out.Usage == nil || out.Usage.TotalTokens != 15 {
+		t.Fatalf("usage = %+v", out.Usage)
+	}
+}
+
+func TestConvertAnthropicResponseToResponses(t *testing.T) {
+	stop := "tool_use"
+	in := &AnthropicResponse{
+		ID:    "msg_test",
+		Type:  "message",
+		Role:  "assistant",
+		Model: "claude-sonnet-4-5",
+		Content: []AnthropicContent{
+			{Type: "text", Text: "checking"},
+			{
+				Type:  "tool_use",
+				ID:    "call_123",
+				Name:  "shell_command",
+				Input: json.RawMessage(`{"command":"Get-ChildItem"}`),
+			},
+		},
+		StopReason: &stop,
+		Usage: AnthropicUsage{
+			InputTokens:          12,
+			OutputTokens:         6,
+			CacheReadInputTokens: 5,
+		},
+	}
+
+	out := ConvertAnthropicResponseToResponses(in, "client-model")
+	if out.Object != "response" || out.Status != "completed" || out.Model != "client-model" {
+		t.Fatalf("unexpected response: %+v", out)
+	}
+	if len(out.Output) != 2 {
+		t.Fatalf("output = %+v", out.Output)
+	}
+	if out.Output[0].Type != "message" || out.Output[0].Content[0].Text != "checking" {
+		t.Fatalf("message output = %+v", out.Output[0])
+	}
+	if out.Output[1].Type != "function_call" ||
+		out.Output[1].CallID != "call_123" ||
+		out.Output[1].Arguments != `{"command":"Get-ChildItem"}` {
+		t.Fatalf("tool output = %+v", out.Output[1])
+	}
+	if out.Usage == nil || out.Usage.TotalTokens != 18 ||
+		out.Usage.InputTokensDetails.CachedTokens != 5 {
 		t.Fatalf("usage = %+v", out.Usage)
 	}
 }

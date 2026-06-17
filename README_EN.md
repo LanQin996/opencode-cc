@@ -50,7 +50,11 @@ Each protocol implements the `TranslateRequest`, `TranslateResponse`, and `Trans
   response, allowing OpenAI SDKs and compatible desktop clients to connect directly. The OpenAI path passes through
   Zen's native `/go/v1/chat/completions` JSON/SSE response without converting it to Anthropic format.
 - **Codex CLI compatibility.** Exposes `POST /v1/responses` and translates Codex Responses API requests, streaming
-  text events, and function calls to and from Zen's `/go/v1/chat/completions`, including multi-turn tool execution.
+  text events, and function calls to Zen. OpenAI-compatible target models use `/go/v1/chat/completions`, while
+  Claude/Qwen target models can use the native `/v1/messages` upstream path.
+- **Smart native Anthropic routing.** `native_anthropic` is enabled by default. Only `claude-*` / `qwen*` target
+  models are forwarded directly to upstream `/v1/messages`, preserving `cache_control`, native Anthropic SSE, and
+  extension fields. GLM, DeepSeek, Kimi, and other target models continue using translation mode.
 - **A built-in catalog of 49 models.** The Models page displays pricing, context limits, capability tags, and protocol
   badges. Models can be added to mappings directly from the Config page.
 - **A single static binary.** The React SPA is embedded with `embed.FS`, so Node.js is not required at runtime.
@@ -97,6 +101,20 @@ export ANTHROPIC_BASE_URL=http://localhost:8787
 export ANTHROPIC_AUTH_TOKEN=local    # Any value works when proxy auth is disabled
 claude
 ```
+
+If your upstream base URL supports Anthropic Messages, for example `<base>/v1/messages`,
+**smart native Anthropic routing** is used by default. You can also set it explicitly:
+
+```bash
+export OPENCODE_CC_UPSTREAM=https://opencode.ai/zen/go
+export OPENCODE_CC_NATIVE_ANTHROPIC=true
+```
+
+When enabled, the proxy first resolves the target model from the mapping table. `claude-*` / `qwen*` target models are
+sent directly to upstream `/v1/messages` with only the `model` field rewritten; other target models are still
+translated to OpenAI Chat Completions. In the example above, Claude/Qwen target models are forwarded to
+`https://opencode.ai/zen/go/v1/messages`. The native path sends both `Authorization: Bearer <key>` and
+`x-api-key: <key>` to support OpenAI-style and Anthropic-style authentication.
 
 For the OpenAI SDK or compatible clients, set the base URL to `http://localhost:8787/v1`:
 
@@ -149,7 +167,9 @@ codex
 ```
 
 `model` may be a real Zen model ID or an alias configured in the dashboard. `kimi-k2.7-code` is the recommended
-coding-oriented model.
+coding-oriented model. If the mapping resolves to `claude-*` / `qwen*`, Codex `/v1/responses` requests are converted
+to native Anthropic Messages upstream requests; all other target models continue to use OpenAI Chat Completions
+translation.
 
 ### Development Mode with HMR
 
@@ -195,11 +215,11 @@ Zen exposes a native Anthropic Messages API for Claude and Qwen models. The prox
 request body, response body, and SSE stream are forwarded unchanged. This is the simplest path and requires no tool-call
 translation.
 
-### Codex Responses ↔ OpenAI Chat
+### Codex Responses ↔ OpenAI Chat / Anthropic Messages
 
-For `/v1/responses`, the proxy converts Codex `instructions`, `input[]`, `function_call`,
-`function_call_output`, and function tools into OpenAI Chat Completions messages. Text deltas, streamed
-`tool_calls` arguments, and usage from Zen are rebuilt as standard Responses events such as
+For `/v1/responses`, the proxy chooses the upstream format by target model. Non-Anthropic-native models are converted
+to OpenAI Chat Completions messages, while `claude-*` / `qwen*` target models are converted to Anthropic Messages
+requests. Text deltas, streamed tool-call arguments, and usage from Zen are rebuilt as standard Responses events such as
 `response.output_text.delta`, `response.function_call_arguments.delta`, and `response.completed`.
 
 This compatibility layer runs locally in the proxy and does not require a native `/v1/responses` endpoint upstream.
@@ -218,6 +238,7 @@ This compatibility layer runs locally in the proxy and does not require a native
 {
   "listen_addr": ":8787",
   "upstream_base": "https://opencode.ai/zen",
+  "native_anthropic": true,   // true smart-routes claude-* / qwen* target models to <upstream_base>/v1/messages
   "zen_api_key": "",           // Required Bearer token for the Zen gateway
   "panel_token": "",           // Web dashboard password; empty means open access
   "require_api_key": false,    // When true, /v1/* always requires a valid client API key
@@ -242,10 +263,10 @@ unchanged.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/v1/messages` | `stream:true` returns SSE; `stream:false` returns JSON |
+| POST | `/v1/messages` | Smart-routes by target model: Claude/Qwen use Anthropic, other models use OpenAI Chat translation |
 | POST | `/v1/messages/count_tokens` | Best-effort token estimation |
 | POST | `/v1/chat/completions` | OpenAI Chat Completions with streaming and non-streaming support |
-| POST | `/v1/responses` | OpenAI Responses API for Codex CLI, including streaming text and function calls |
+| POST | `/v1/responses` | OpenAI Responses API for Codex CLI; converts to OpenAI Chat or native Anthropic upstreams |
 | GET | `/v1/models` | Model list compatible with both OpenAI and Anthropic clients |
 | GET | `/healthz` | Liveness probe |
 

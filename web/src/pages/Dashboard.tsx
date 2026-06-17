@@ -56,6 +56,10 @@ export default function Dashboard() {
   const errorRate = summary?.requests_last_24h
     ? (summary.errors_last_24h / summary.requests_last_24h) * 100
     : 0;
+  const inputTokens = summary?.total_input_tokens ?? 0;
+  const cachedInputTokens = summary?.total_cached_input_tokens ?? 0;
+  const cacheCreationTokens = summary?.total_cache_creation_input_tokens ?? 0;
+  const cacheHitRate = inputTokens ? (cachedInputTokens / inputTokens) * 100 : 0;
 
   const maxModelReq = Math.max(1, ...models.map((m) => m.requests));
 
@@ -78,7 +82,7 @@ export default function Dashboard() {
       )}
 
       {/* Stat row */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
         <StatCard
           label="请求数 · 24小时"
           value={fmtNum(summary?.requests_last_24h ?? 0)}
@@ -100,6 +104,12 @@ export default function Dashboard() {
             summary?.total_output_tokens ?? 0
           )}`}
           accent="text-accent-cyan"
+        />
+        <StatCard
+          label="缓存命中"
+          value={`${cacheHitRate.toFixed(1)}%`}
+          sub={`命中 ${fmtNum(cachedInputTokens)} · 写入 ${fmtNum(cacheCreationTokens)}`}
+          accent={cacheHitRate > 0 ? "text-accent-green" : "text-slate-400"}
         />
         <StatCard
           label="延迟 p95"
@@ -171,6 +181,9 @@ export default function Dashboard() {
                 </div>
                 <div className="w-24 text-right text-sm text-slate-500 tabular-nums">
                   {fmtNum(m.tokens)} tok
+                </div>
+                <div className="w-24 text-right text-xs text-accent-green/80 tabular-nums">
+                  {m.cached_input_tokens ? `${fmtNum(m.cached_input_tokens)} 缓存` : "—"}
                 </div>
               </div>
             ))}

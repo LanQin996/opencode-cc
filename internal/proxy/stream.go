@@ -416,13 +416,16 @@ func (c *StreamConverter) writeEvent(event string, payload any) error {
 // ---- Upstream SSE parser ----
 
 // ScanOpenAIStream reads an OpenAI SSE stream from r and invokes onChunk for
-// each decoded chunk. It returns io.EOF when the stream terminates cleanly
-// (after "data: [DONE]") or the first non-EOF error otherwise.
+// each decoded chunk. It returns io.EOF when the stream terminates cleanly.
+// Some OpenAI-compatible upstreams end the HTTP stream without a final
+// "data: [DONE]"; if at least one valid chunk was seen, that is accepted as a
+// clean EOF.
 func ScanOpenAIStream(r io.Reader, onChunk func(*OpenAIStreamChunk) error) error {
 	sc := bufio.NewScanner(r)
 	// Some upstreams send very large chunks; bump the buffer.
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	var sawDone bool
+	var sawChunk bool
 	for sc.Scan() {
 		line := sc.Text()
 		if line == "" {
@@ -442,6 +445,7 @@ func ScanOpenAIStream(r io.Reader, onChunk func(*OpenAIStreamChunk) error) error
 			// Skip malformed line rather than killing the whole stream.
 			continue
 		}
+		sawChunk = true
 		if err := onChunk(&chunk); err != nil {
 			return err
 		}
@@ -449,7 +453,7 @@ func ScanOpenAIStream(r io.Reader, onChunk func(*OpenAIStreamChunk) error) error
 	if err := sc.Err(); err != nil {
 		return err
 	}
-	if !sawDone {
+	if !sawDone && !sawChunk {
 		return errors.New("upstream stream ended without [DONE]")
 	}
 	return io.EOF

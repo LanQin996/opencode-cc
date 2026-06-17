@@ -83,6 +83,33 @@ func TestStreamConversion(t *testing.T) {
 	}
 }
 
+func TestScanOpenAIStreamAcceptsEOFWithoutDoneAfterChunks(t *testing.T) {
+	var seen int
+	err := ScanOpenAIStream(strings.NewReader(`data: {"choices":[{"index":0,"delta":{"content":"OK"}}]}`+"\n\n"), func(c *OpenAIStreamChunk) error {
+		seen++
+		if len(c.Choices) != 1 || c.Choices[0].Delta.Content != "OK" {
+			t.Fatalf("unexpected chunk: %+v", c)
+		}
+		return nil
+	})
+	if err != io.EOF {
+		t.Fatalf("ScanOpenAIStream error = %v, want io.EOF", err)
+	}
+	if seen != 1 {
+		t.Fatalf("seen chunks = %d, want 1", seen)
+	}
+}
+
+func TestScanOpenAIStreamRejectsEOFWithoutChunks(t *testing.T) {
+	err := ScanOpenAIStream(strings.NewReader("event: ping\n\n"), func(*OpenAIStreamChunk) error {
+		t.Fatal("callback should not be called")
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "without [DONE]") {
+		t.Fatalf("ScanOpenAIStream error = %v, want missing DONE error", err)
+	}
+}
+
 func TestStreamConversionRejectsUndeclaredToolCalls(t *testing.T) {
 	var out bytes.Buffer
 	conv, err := NewStreamConverter(&out, "test-model", nil)

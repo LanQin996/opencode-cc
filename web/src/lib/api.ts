@@ -5,6 +5,8 @@ export interface Summary {
   total_errors: number;
   total_input_tokens: number;
   total_output_tokens: number;
+  total_cached_input_tokens: number;
+  total_cache_creation_input_tokens: number;
   requests_last_24h: number;
   errors_last_24h: number;
 }
@@ -15,12 +17,15 @@ export interface HourPoint {
   errors: number;
   input_tokens: number;
   output_tokens: number;
+  cached_input_tokens: number;
+  cache_creation_input_tokens: number;
 }
 
 export interface ModelUsagePoint {
   model: string;
   requests: number;
   tokens: number;
+  cached_input_tokens: number;
 }
 
 export interface Latency {
@@ -41,6 +46,8 @@ export interface LogRow {
   duration_ms: number;
   input_tokens: number;
   output_tokens: number;
+  cached_input_tokens: number;
+  cache_creation_input_tokens: number;
   stop_reason: string;
   error: string;
   req_body?: string;
@@ -50,6 +57,7 @@ export interface LogRow {
 export interface PanelConfig {
   listen_addr: string;
   upstream_base: string;
+  native_anthropic: boolean;
   zen_api_key_masked: string;
   zen_api_key_set: boolean;
   panel_token_set: boolean;
@@ -59,6 +67,10 @@ export interface PanelConfig {
   log_requests: boolean;
   max_body_log_bytes: number;
   request_timeout_seconds: number;
+  prompt_cache_enabled: boolean;
+  prompt_cache_key_prefix: string;
+  prompt_cache_anthropic_control: boolean;
+  prompt_cache_normalize: boolean;
 }
 
 export interface TestResult {

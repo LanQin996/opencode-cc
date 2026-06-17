@@ -119,6 +119,7 @@ func (s *Server) prepareOpenAIRequest(body []byte) ([]byte, string, string, bool
 
 	targetModel := s.cfg.ResolveModel(incomingModel)
 	payload["model"], _ = json.Marshal(targetModel)
+	proxy.ApplyRawOpenAIPromptCache(payload, promptCacheOptionsFromConfig(s.cfg.Snapshot()))
 	upBody, err := json.Marshal(payload)
 	if err != nil {
 		return nil, "", "", false, fmt.Errorf("could not encode upstream request: %w", err)
@@ -180,8 +181,8 @@ func (s *Server) relayOpenAIJSON(
 	if len(out.Choices) > 0 {
 		stopReason = out.Choices[0].FinishReason
 	}
-	s.logSuccess(r.Context(), r, incomingModel, targetModel, stream, status,
-		out.Usage.PromptTokens, out.Usage.CompletionTokens, stopReason,
+	s.logSuccessWithCache(r.Context(), r, incomingModel, targetModel, stream, status,
+		out.Usage.PromptTokens, out.Usage.CompletionTokens, out.Usage.CachedPromptTokens(), 0, stopReason,
 		string(reqBody), string(raw), time.Since(start))
 }
 
@@ -239,8 +240,8 @@ func (s *Server) relayOpenAIStream(
 		return
 	}
 
-	s.logSuccess(r.Context(), r, incomingModel, targetModel, true, resp.StatusCode,
-		relay.inputTokens, relay.outputTokens, relay.stopReason,
+	s.logSuccessWithCache(r.Context(), r, incomingModel, targetModel, true, resp.StatusCode,
+		relay.inputTokens, relay.outputTokens, relay.cachedInputTokens, 0, relay.stopReason,
 		string(reqBody), responseLog.String(), time.Since(start))
 }
 
@@ -253,10 +254,11 @@ type openAIStreamRelay struct {
 	log      *strings.Builder
 	logLimit int
 
-	pending      []byte
-	inputTokens  int
-	outputTokens int
-	stopReason   string
+	pending           []byte
+	inputTokens       int
+	outputTokens      int
+	cachedInputTokens int
+	stopReason        string
 }
 
 func (r *openAIStreamRelay) Write(p []byte) (int, error) {
@@ -292,6 +294,7 @@ func (r *openAIStreamRelay) observe(p []byte) {
 		if chunk.Usage != nil {
 			r.inputTokens = chunk.Usage.PromptTokens
 			r.outputTokens = chunk.Usage.CompletionTokens
+			r.cachedInputTokens = chunk.Usage.CachedPromptTokens()
 		}
 		for _, choice := range chunk.Choices {
 			if choice.FinishReason != nil {

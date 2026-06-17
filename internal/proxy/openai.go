@@ -16,6 +16,7 @@ type OpenAIRequest struct {
 	Tools             []OpenAITool         `json:"tools,omitempty"`
 	ToolChoice        any                  `json:"tool_choice,omitempty"`
 	ParallelToolCalls *bool                `json:"parallel_tool_calls,omitempty"`
+	PromptCacheKey    string               `json:"prompt_cache_key,omitempty"`
 }
 
 // OpenAIStreamOptions asks the upstream to include usage in the final chunk.

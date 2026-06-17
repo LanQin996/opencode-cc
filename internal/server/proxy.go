@@ -15,9 +15,9 @@ import (
 	"github.com/Kiowx/opencode-cc/internal/store"
 )
 
-// Proxy handles POST /v1/messages. It converts the Anthropic request to an
-// OpenAI Chat Completions request, forwards it to Zen, and converts the
-// response back (streaming or not).
+// Proxy handles POST /v1/messages. Native Anthropic-capable target models go
+// straight to the upstream Messages API; all other models are translated to
+// OpenAI Chat Completions and converted back.
 func (s *Server) Proxy() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -36,20 +36,27 @@ func (s *Server) Proxy() http.HandlerFunc {
 		}
 
 		// Resolve target model under a short read lock.
-		s.cfg.RLock()
-		upstream := s.cfg.UpstreamBase
-		zenKey := s.cfg.ZenAPIKey
-		timeout := time.Duration(s.cfg.RequestTimeoutSeconds) * time.Second
-		s.cfg.RUnlock()
+		cfg := s.cfg.Snapshot()
+		upstream := cfg.UpstreamBase
+		nativeAnthropic := cfg.NativeAnthropic
+		zenKey := cfg.ZenAPIKey
+		timeout := time.Duration(cfg.RequestTimeoutSeconds) * time.Second
 
 		targetModel := s.cfg.ResolveModel(areq.Model)
-		oreq := proxy.ConvertRequest(&areq, func(string) string { return targetModel })
 
 		if zenKey == "" {
 			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "no Zen API key configured. Set ZEN_API_KEY or configure it in the web panel.")
 			s.logFailed(ctx, r, areq.Model, targetModel, areq.Stream, http.StatusUnauthorized, "no zen api key", body, time.Since(start))
 			return
 		}
+
+		if nativeAnthropic && proxy.IsNativeAnthropicModel(targetModel) {
+			s.proxyNativeAnthropic(w, r, body, &areq, upstream, zenKey, targetModel, timeout, start)
+			return
+		}
+
+		oreq := proxy.ConvertRequest(&areq, func(string) string { return targetModel })
+		proxy.ApplyOpenAIPromptCache(oreq, promptCacheOptionsFromConfig(cfg))
 
 		// Marshal the upstream request.
 		upBody, err := json.Marshal(oreq)
@@ -109,6 +116,245 @@ func (s *Server) Proxy() http.HandlerFunc {
 	}
 }
 
+func (s *Server) proxyNativeAnthropic(
+	w http.ResponseWriter,
+	r *http.Request,
+	body []byte,
+	areq *proxy.AnthropicRequest,
+	upstream, zenKey, targetModel string,
+	timeout time.Duration,
+	start time.Time,
+) {
+	upBody, err := proxy.PrepareAnthropicPromptCacheBody(body, targetModel, promptCacheOptionsFromConfig(s.cfg.Snapshot()))
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+
+	upURL := strings.TrimRight(upstream, "/") + "/v1/messages"
+	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
+	if err != nil {
+		writeAnthropicError(w, http.StatusInternalServerError, "api_error", "could not build upstream request: "+err.Error())
+		return
+	}
+	upReq.Header.Set("Content-Type", "application/json")
+	upReq.Header.Set("Authorization", "Bearer "+zenKey)
+	upReq.Header.Set("x-api-key", zenKey)
+	upReq.Header.Set("User-Agent", "opencode-cc/1.3")
+	if areq.Stream {
+		upReq.Header.Set("Accept", "text/event-stream")
+	} else {
+		upReq.Header.Set("Accept", "application/json")
+	}
+	if version := r.Header.Get("anthropic-version"); version != "" {
+		upReq.Header.Set("anthropic-version", version)
+	} else {
+		upReq.Header.Set("anthropic-version", "2023-06-01")
+	}
+	if beta := r.Header.Get("anthropic-beta"); beta != "" {
+		upReq.Header.Set("anthropic-beta", beta)
+	}
+
+	httpClient := s.httpClient
+	if timeout > 0 {
+		httpClient = &http.Client{Timeout: timeout}
+	}
+	resp, err := httpClient.Do(upReq)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
+		s.logFailed(r.Context(), r, areq.Model, targetModel, areq.Stream, http.StatusBadGateway, err.Error(), body, time.Since(start))
+		return
+	}
+
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if areq.Stream && resp.StatusCode < http.StatusBadRequest &&
+		(contentType == "" || strings.Contains(contentType, "text/event-stream")) {
+		s.relayNativeAnthropicStream(w, resp, r, areq.Model, targetModel, body, start)
+		return
+	}
+	s.relayNativeAnthropicJSON(w, resp, r, areq.Model, targetModel, areq.Stream, body, start)
+}
+
+func (s *Server) relayNativeAnthropicJSON(
+	w http.ResponseWriter,
+	resp *http.Response,
+	r *http.Request,
+	inModel, target string,
+	stream bool,
+	reqBody []byte,
+	start time.Time,
+) {
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadGateway, "api_error", "could not read upstream body: "+err.Error())
+		s.logFailed(r.Context(), r, inModel, target, stream, http.StatusBadGateway, err.Error(), reqBody, time.Since(start))
+		return
+	}
+	if len(raw) > maxResponseBytes {
+		const msg = "upstream response exceeded the maximum allowed size"
+		writeAnthropicError(w, http.StatusBadGateway, "api_error", msg)
+		s.logFailed(r.Context(), r, inModel, target, stream, http.StatusBadGateway, msg, reqBody, time.Since(start))
+		return
+	}
+
+	copyOpenAIHeaders(w.Header(), resp.Header, false)
+	status := resp.StatusCode
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(raw)
+
+	if status >= http.StatusBadRequest {
+		msg := extractAnthropicError(raw)
+		if msg == "" {
+			msg = extractOpenAIError(raw)
+		}
+		if msg == "" {
+			msg = strings.TrimSpace(string(raw))
+		}
+		s.logFailed(r.Context(), r, inModel, target, stream, status, msg, reqBody, time.Since(start))
+		return
+	}
+
+	var out struct {
+		StopReason *string              `json:"stop_reason"`
+		Usage      proxy.AnthropicUsage `json:"usage"`
+	}
+	_ = json.Unmarshal(raw, &out)
+	s.logSuccessWithCache(r.Context(), r, inModel, target, stream, status,
+		out.Usage.InputTokens, out.Usage.OutputTokens,
+		out.Usage.CacheReadInputTokens, out.Usage.CacheCreationInputTokens,
+		stopReasonStr(out.StopReason),
+		string(reqBody), string(raw), time.Since(start))
+}
+
+func (s *Server) relayNativeAnthropicStream(
+	w http.ResponseWriter,
+	resp *http.Response,
+	r *http.Request,
+	inModel, target string,
+	reqBody []byte,
+	start time.Time,
+) {
+	defer resp.Body.Close()
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeAnthropicError(w, http.StatusInternalServerError, "api_error", "streaming not supported by this server")
+		return
+	}
+
+	reader := io.Reader(resp.Body)
+	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		gz, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			writeAnthropicError(w, http.StatusBadGateway, "api_error", "could not decompress upstream stream: "+err.Error())
+			return
+		}
+		defer gz.Close()
+		reader = gz
+	}
+
+	copyOpenAIHeaders(w.Header(), resp.Header, true)
+	w.WriteHeader(resp.StatusCode)
+	flusher.Flush()
+
+	var responseLog strings.Builder
+	relay := &nativeAnthropicStreamRelay{
+		dst:      w,
+		flusher:  flusher,
+		log:      &responseLog,
+		logLimit: s.cfg.Snapshot().MaxBodyLogBytes,
+	}
+	if _, err := io.Copy(relay, reader); err != nil {
+		errPayload, _ := json.Marshal(map[string]any{
+			"type":  "error",
+			"error": map[string]string{"type": "api_error", "message": "upstream stream error: " + err.Error()},
+		})
+		_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", errPayload)
+		flusher.Flush()
+		s.logFailed(r.Context(), r, inModel, target, true, http.StatusBadGateway, err.Error(), reqBody, time.Since(start))
+		return
+	}
+
+	s.logSuccessWithCache(r.Context(), r, inModel, target, true, resp.StatusCode,
+		relay.inputTokens, relay.outputTokens,
+		relay.cachedInputTokens, relay.cacheCreationInputTokens,
+		relay.stopReason,
+		string(reqBody), responseLog.String(), time.Since(start))
+}
+
+type nativeAnthropicStreamRelay struct {
+	dst      io.Writer
+	flusher  http.Flusher
+	log      *strings.Builder
+	logLimit int
+
+	pending                  []byte
+	inputTokens              int
+	outputTokens             int
+	cachedInputTokens        int
+	cacheCreationInputTokens int
+	stopReason               string
+}
+
+func (r *nativeAnthropicStreamRelay) Write(p []byte) (int, error) {
+	n, err := r.dst.Write(p)
+	if n > 0 {
+		appendLimited(r.log, string(p[:n]), r.logLimit)
+		r.observe(p[:n])
+		r.flusher.Flush()
+	}
+	return n, err
+}
+
+func (r *nativeAnthropicStreamRelay) observe(p []byte) {
+	r.pending = append(r.pending, p...)
+	for {
+		i := bytes.IndexByte(r.pending, '\n')
+		if i < 0 {
+			return
+		}
+		line := strings.TrimSuffix(string(r.pending[:i]), "\r")
+		r.pending = r.pending[i+1:]
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var event struct {
+			Message struct {
+				Usage proxy.AnthropicUsage `json:"usage"`
+			} `json:"message"`
+			Delta struct {
+				StopReason *string `json:"stop_reason"`
+			} `json:"delta"`
+			Usage *struct {
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal([]byte(data), &event) != nil {
+			continue
+		}
+		if event.Message.Usage.InputTokens > 0 ||
+			event.Message.Usage.CacheReadInputTokens > 0 ||
+			event.Message.Usage.CacheCreationInputTokens > 0 {
+			r.inputTokens = event.Message.Usage.InputTokens
+			r.cachedInputTokens = event.Message.Usage.CacheReadInputTokens
+			r.cacheCreationInputTokens = event.Message.Usage.CacheCreationInputTokens
+		}
+		if event.Usage != nil {
+			r.outputTokens = event.Usage.OutputTokens
+		}
+		if event.Delta.StopReason != nil {
+			r.stopReason = *event.Delta.StopReason
+		}
+	}
+}
+
 // passUpstreamError reads the upstream error body and returns an Anthropic-
 // shaped error to the client, while logging the failed request.
 func (s *Server) passUpstreamError(w http.ResponseWriter, resp *http.Response, r *http.Request, inModel, target string, reqBody []byte, start time.Time) {
@@ -156,8 +402,10 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, resp *http.Respo
 	writeJSON(w, http.StatusOK, aresp)
 
 	// Log a success row.
-	s.logSuccess(r.Context(), r, inModel, target, false, http.StatusOK,
-		aresp.Usage.InputTokens, aresp.Usage.OutputTokens, stopReasonStr(aresp.StopReason),
+	s.logSuccessWithCache(r.Context(), r, inModel, target, false, http.StatusOK,
+		aresp.Usage.InputTokens, aresp.Usage.OutputTokens,
+		aresp.Usage.CacheReadInputTokens, aresp.Usage.CacheCreationInputTokens,
+		stopReasonStr(aresp.StopReason),
 		string(reqBody), mustJSON(aresp), time.Since(start))
 }
 
@@ -181,6 +429,7 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response
 	var stopSeq *string
 	stopReason := ""
 	var inputTok, outputTok int
+	var cachedInputTok int
 
 	conv, err := proxy.NewStreamConverter(w, inModel, stopSeq)
 	if err != nil {
@@ -202,6 +451,7 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response
 		if chunk.Usage != nil {
 			inputTok = chunk.Usage.PromptTokens
 			outputTok = chunk.Usage.CompletionTokens
+			cachedInputTok = chunk.Usage.CachedPromptTokens()
 		}
 		return conv.HandleChunk(chunk)
 	})
@@ -221,8 +471,8 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response
 	flusher.Flush()
 
 	// Log.
-	s.logSuccess(r.Context(), r, inModel, target, true, http.StatusOK,
-		inputTok, outputTok, stopReason, string(reqBody), "[streamed]", time.Since(start))
+	s.logSuccessWithCache(r.Context(), r, inModel, target, true, http.StatusOK,
+		inputTok, outputTok, cachedInputTok, 0, stopReason, string(reqBody), "[streamed]", time.Since(start))
 }
 
 // CountTokens handles POST /v1/messages/count_tokens with a rough estimate
@@ -261,6 +511,10 @@ func estimateTokens(areq *proxy.AnthropicRequest) int {
 // ---- logging helpers ----
 
 func (s *Server) logSuccess(ctx context.Context, r *http.Request, inModel, target string, stream bool, status, inputTok, outputTok int, stopReason, reqBody, respBody string, dur time.Duration) {
+	s.logSuccessWithCache(ctx, r, inModel, target, stream, status, inputTok, outputTok, 0, 0, stopReason, reqBody, respBody, dur)
+}
+
+func (s *Server) logSuccessWithCache(ctx context.Context, r *http.Request, inModel, target string, stream bool, status, inputTok, outputTok, cachedInputTok, cacheCreationInputTok int, stopReason, reqBody, respBody string, dur time.Duration) {
 	apiKey := APIKeyFromContext(ctx)
 	if !s.shouldLog() {
 		// Still record usage for quota even if request logging is off.
@@ -278,20 +532,22 @@ func (s *Server) logSuccess(ctx context.Context, r *http.Request, inModel, targe
 	go func() {
 		bg := context.Background()
 		_ = s.store.InsertRequest(bg, &store.RequestRow{
-			Ts:            time.Now(),
-			Method:        r.Method,
-			Path:          r.URL.Path,
-			IncomingModel: inModel,
-			TargetModel:   target,
-			Stream:        stream,
-			Status:        status,
-			DurationMs:    dur.Milliseconds(),
-			InputTokens:   inputTok,
-			OutputTokens:  outputTok,
-			StopReason:    stopReason,
-			ReqBody:       reqBody,
-			RespBody:      respBody,
-			APIKeyID:      keyID,
+			Ts:                       time.Now(),
+			Method:                   r.Method,
+			Path:                     r.URL.Path,
+			IncomingModel:            inModel,
+			TargetModel:              target,
+			Stream:                   stream,
+			Status:                   status,
+			DurationMs:               dur.Milliseconds(),
+			InputTokens:              inputTok,
+			OutputTokens:             outputTok,
+			CachedInputTokens:        cachedInputTok,
+			CacheCreationInputTokens: cacheCreationInputTok,
+			StopReason:               stopReason,
+			ReqBody:                  reqBody,
+			RespBody:                 respBody,
+			APIKeyID:                 keyID,
 		})
 	}()
 	s.recordUsage(apiKey, inputTok+outputTok, 1)
@@ -425,6 +681,18 @@ func extractOpenAIError(b []byte) string {
 		return env.Error.Message
 	}
 	return env.Message
+}
+
+func extractAnthropicError(b []byte) string {
+	var env struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(b, &env); err != nil {
+		return ""
+	}
+	return env.Error.Message
 }
 
 const (

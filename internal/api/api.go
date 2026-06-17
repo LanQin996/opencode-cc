@@ -153,7 +153,7 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
 		"time":    time.Now().Format(time.RFC3339),
-		"version": "1.0.1",
+		"version": "1.2.3",
 	})
 }
 
@@ -290,17 +290,22 @@ func publicConfig(c *config.Config) map[string]any {
 		}
 	}
 	return map[string]any{
-		"listen_addr":             c.ListenAddr,
-		"upstream_base":           c.UpstreamBase,
-		"zen_api_key_masked":      masked,
-		"zen_api_key_set":         key != "",
-		"panel_token_set":         c.PanelToken != "",
-		"require_api_key":         c.RequireAPIKey,
-		"default_model":           c.DefaultModel,
-		"model_mappings":          c.ModelMappings,
-		"log_requests":            c.LogRequests,
-		"max_body_log_bytes":      c.MaxBodyLogBytes,
-		"request_timeout_seconds": c.RequestTimeoutSeconds,
+		"listen_addr":                    c.ListenAddr,
+		"upstream_base":                  c.UpstreamBase,
+		"native_anthropic":               c.NativeAnthropic,
+		"zen_api_key_masked":             masked,
+		"zen_api_key_set":                key != "",
+		"panel_token_set":                c.PanelToken != "",
+		"require_api_key":                c.RequireAPIKey,
+		"default_model":                  c.DefaultModel,
+		"model_mappings":                 c.ModelMappings,
+		"log_requests":                   c.LogRequests,
+		"max_body_log_bytes":             c.MaxBodyLogBytes,
+		"request_timeout_seconds":        c.RequestTimeoutSeconds,
+		"prompt_cache_enabled":           c.PromptCacheEnabled,
+		"prompt_cache_key_prefix":        c.PromptCacheKeyPrefix,
+		"prompt_cache_anthropic_control": c.PromptCacheAnthropicControl,
+		"prompt_cache_normalize":         c.PromptCacheNormalize,
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 )
 
 // ConvertRequest turns an Anthropic Messages request into an OpenAI Chat
@@ -47,6 +48,7 @@ func ConvertRequest(in *AnthropicRequest, resolveModel func(string) string) *Ope
 				},
 			})
 		}
+		sortOpenAITools(out.Tools)
 	} else {
 		// Be explicit for models that may hallucinate tool calls even when the
 		// client did not declare any tools. A tool_use block for an undeclared
@@ -288,6 +290,10 @@ func compactJSON(raw jsonRawMessage) string {
 
 // ensureObjectSchema guarantees the schema is a JSON object (the OpenAI spec
 // requires {"type":"object", ...}). Anthropic schemas sometimes omit "type".
+//
+// The output is canonicalised via canonicalJSON so the byte form is stable
+// regardless of the input key order — this keeps the tools prefix (which sits
+// at the very start of the prompt) byte-stable for upstream prompt-cache hits.
 func ensureObjectSchema(raw jsonRawMessage) jsonRawMessage {
 	if len(raw) == 0 {
 		return jsonRawMessage(`{"type":"object"}`)
@@ -302,13 +308,25 @@ func ensureObjectSchema(raw jsonRawMessage) jsonRawMessage {
 	if _, ok := probe["type"]; !ok {
 		probe["type"] = "object"
 	}
-	b, err := json.Marshal(probe)
+	// Re-serialise to bytes first, then run through canonicalJSON for
+	// recursive, order-stable output (handles nested objects/arrays too).
+	reenc, err := json.Marshal(probe)
 	if err != nil {
 		return jsonRawMessage(`{"type":"object"}`)
 	}
-	return b
+	canonical, ok := canonicalJSON(reenc)
+	if !ok {
+		return reenc
+	}
+	return canonical
 }
 
+// canonicalJSON parses raw into a generic value (with json.Number preserved so
+// numeric precision is not lost) and re-emits it with a deterministic byte
+// form: object keys sorted recursively (including inside arrays), compact
+// whitespace. Returns (bytes, true) on success, (nil, false) if raw is not a
+// single valid JSON value (rejecting trailing content). Byte stability is what
+// lets the upstream token-prefix prompt cache hit across rounds.
 func canonicalJSON(raw jsonRawMessage) (jsonRawMessage, bool) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
@@ -320,9 +338,39 @@ func canonicalJSON(raw jsonRawMessage) (jsonRawMessage, bool) {
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return nil, false
 	}
-	out, err := json.Marshal(value)
+	out, err := json.Marshal(canonicalizeValue(value))
 	if err != nil {
 		return nil, false
 	}
 	return out, true
+}
+
+// canonicalizeValue returns v with all nested maps' keys sorted, so that
+// json.Marshal produces a stable byte form. Numbers are kept as json.Number to
+// avoid float re-encoding losing precision (e.g. large integers).
+func canonicalizeValue(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		ordered := make(map[string]any, len(val))
+		for _, k := range keys {
+			ordered[k] = canonicalizeValue(val[k])
+		}
+		// json.Marshal sorts map keys lexicographically, so the explicit
+		// ordering above is preserved on output.
+		return ordered
+	case []any:
+		out := make([]any, len(val))
+		for i, item := range val {
+			out[i] = canonicalizeValue(item)
+		}
+		return out
+	default:
+		// string / json.Number / bool / nil — return as-is.
+		return v
+	}
 }

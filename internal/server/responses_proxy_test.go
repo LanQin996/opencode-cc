@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Kiowx/opencode-cc/internal/config"
 	"github.com/Kiowx/opencode-cc/internal/store"
 )
 
@@ -124,7 +126,8 @@ func TestResponsesStream(t *testing.T) {
 				flusher.Flush()
 			}
 		}
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		// Some OpenAI-compatible providers close the HTTP stream cleanly
+		// without a final data: [DONE] sentinel.
 	})
 	_, st, httpSrv := newOpenAITestServer(t, upstream)
 
@@ -162,6 +165,202 @@ func TestResponsesStream(t *testing.T) {
 			row.Stream &&
 			row.InputTokens == 5 &&
 			row.OutputTokens == 1 &&
+			row.StopReason == "stop"
+	})
+}
+
+func TestResponsesNativeAnthropicNonStream(t *testing.T) {
+	var gotPath, gotAuth, gotAPIKey, gotAccept, gotVersion string
+	var gotBody map[string]json.RawMessage
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		gotAPIKey = r.Header.Get("x-api-key")
+		gotAccept = r.Header.Get("Accept")
+		gotVersion = r.Header.Get("anthropic-version")
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"msg_resp_native",
+			"type":"message",
+			"role":"assistant",
+			"model":"claude-sonnet-4-5",
+			"content":[{"type":"text","text":"native OK"}],
+			"stop_reason":"end_turn",
+			"usage":{"input_tokens":11,"cache_read_input_tokens":4,"output_tokens":2}
+		}`)
+	})
+	srv, st, httpSrv := newOpenAITestServer(t, upstream)
+	srv.cfg.ModelMappings = []config.ModelMapping{
+		{Match: "client-model", Target: "claude-sonnet-4-5"},
+		{Match: "*", Target: ""},
+	}
+
+	body := `{
+		"model":"client-model",
+		"instructions":"Be concise.",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Say OK"}]}],
+		"max_output_tokens":128,
+		"stream":false
+	}`
+	resp, err := http.Post(httpSrv.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, raw)
+	}
+	if gotPath != "/v1/messages" {
+		t.Fatalf("upstream path = %q, want /v1/messages", gotPath)
+	}
+	if gotAuth != "Bearer zen-test-key" || gotAPIKey != "zen-test-key" ||
+		gotAccept != "application/json" || gotVersion != "2023-06-01" {
+		t.Fatalf("upstream headers auth=%q x-api-key=%q accept=%q version=%q", gotAuth, gotAPIKey, gotAccept, gotVersion)
+	}
+	var model string
+	if err := json.Unmarshal(gotBody["model"], &model); err != nil || model != "claude-sonnet-4-5" {
+		t.Fatalf("mapped model = %q, err=%v", model, err)
+	}
+	var maxTokens int
+	if err := json.Unmarshal(gotBody["max_tokens"], &maxTokens); err != nil || maxTokens != 128 {
+		t.Fatalf("max_tokens = %d, err=%v", maxTokens, err)
+	}
+	if !bytes.Contains(gotBody["system"], []byte("cache_control")) {
+		t.Fatalf("cache_control missing from native Anthropic request: %s", gotBody["system"])
+	}
+
+	var out struct {
+		Object string `json:"object"`
+		Status string `json:"status"`
+		Model  string `json:"model"`
+		Output []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+		Usage struct {
+			InputTokens        int `json:"input_tokens"`
+			OutputTokens       int `json:"output_tokens"`
+			InputTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"input_tokens_details"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.Object != "response" || out.Status != "completed" || out.Model != "client-model" {
+		t.Fatalf("unexpected response: %s", raw)
+	}
+	if len(out.Output) != 1 || out.Output[0].Content[0].Text != "native OK" {
+		t.Fatalf("unexpected output: %s", raw)
+	}
+	if out.Usage.InputTokens != 11 || out.Usage.OutputTokens != 2 ||
+		out.Usage.InputTokensDetails.CachedTokens != 4 {
+		t.Fatalf("unexpected usage: %+v", out.Usage)
+	}
+
+	waitForRequestLog(t, st, func(row store.RequestRow) bool {
+		return row.Path == "/v1/responses" &&
+			row.IncomingModel == "client-model" &&
+			row.TargetModel == "claude-sonnet-4-5" &&
+			row.InputTokens == 11 &&
+			row.OutputTokens == 2 &&
+			row.StopReason == "end_turn"
+	})
+}
+
+func TestResponsesNativeAnthropicStream(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model  string `json:"model"`
+			Stream bool   `json:"stream"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if body.Model != "claude-sonnet-4-5" || !body.Stream {
+			t.Fatalf("unexpected upstream request: %+v", body)
+		}
+		if r.Header.Get("Accept") != "text/event-stream" {
+			t.Fatalf("Accept = %q", r.Header.Get("Accept"))
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		events := []string{
+			`event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[],"stop_reason":null,"usage":{"input_tokens":8,"output_tokens":0}}}
+
+`,
+			`event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+`,
+			`event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"native stream"}}
+
+`,
+			`event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}
+
+`,
+			`event: message_stop
+data: {"type":"message_stop"}
+
+`,
+		}
+		for _, event := range events {
+			_, _ = io.WriteString(w, event)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	})
+	srv, st, httpSrv := newOpenAITestServer(t, upstream)
+	srv.cfg.ModelMappings = []config.ModelMapping{
+		{Match: "client-model", Target: "claude-sonnet-4-5"},
+		{Match: "*", Target: ""},
+	}
+
+	body := `{
+		"model":"client-model",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Say OK"}]}],
+		"stream":true
+	}`
+	resp, err := http.Post(httpSrv.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, raw)
+	}
+	out := string(raw)
+	for _, want := range []string{
+		"event: response.created",
+		"event: response.output_text.delta",
+		`"delta":"native stream"`,
+		"event: response.completed",
+		`"input_tokens":8`,
+		`"output_tokens":3`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stream missing %q:\n%s", want, out)
+		}
+	}
+
+	waitForRequestLog(t, st, func(row store.RequestRow) bool {
+		return row.Path == "/v1/responses" &&
+			row.Stream &&
+			row.TargetModel == "claude-sonnet-4-5" &&
+			row.InputTokens == 8 &&
+			row.OutputTokens == 3 &&
 			row.StopReason == "stop"
 	})
 }

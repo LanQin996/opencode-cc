@@ -20,6 +20,43 @@ type AnthropicRequest struct {
 	// Metadata and other rarely-used fields are ignored.
 }
 
+// MarshalJSON omits Anthropic-only optional fields when they are empty. The
+// standard encoding/json omitempty rule does not omit zero-value structs, which
+// would otherwise send tool_choice: {"type":""} to native upstreams.
+func (r AnthropicRequest) MarshalJSON() ([]byte, error) {
+	type request struct {
+		Model       string               `json:"model"`
+		Messages    []AnthropicMessage   `json:"messages"`
+		System      *AnthropicSystem     `json:"system,omitempty"`
+		MaxTokens   int                  `json:"max_tokens"`
+		Temperature *float64             `json:"temperature,omitempty"`
+		TopP        *float64             `json:"top_p,omitempty"`
+		TopK        *int                 `json:"top_k,omitempty"`
+		Stop        []string             `json:"stop_sequences,omitempty"`
+		Stream      bool                 `json:"stream,omitempty"`
+		Tools       []AnthropicTool      `json:"tools,omitempty"`
+		ToolChoice  *AnthropicToolChoice `json:"tool_choice,omitempty"`
+	}
+	out := request{
+		Model:       r.Model,
+		Messages:    r.Messages,
+		MaxTokens:   r.MaxTokens,
+		Temperature: r.Temperature,
+		TopP:        r.TopP,
+		TopK:        r.TopK,
+		Stop:        r.Stop,
+		Stream:      r.Stream,
+		Tools:       r.Tools,
+	}
+	if len(r.System.Blocks) > 0 {
+		out.System = &r.System
+	}
+	if r.ToolChoice.Type != "" {
+		out.ToolChoice = &r.ToolChoice
+	}
+	return jsonMarshal(out)
+}
+
 // AnthropicSystem is either a plain string or a list of content blocks. We
 // accept both shapes via a custom unmarshaler.
 type AnthropicSystem struct {

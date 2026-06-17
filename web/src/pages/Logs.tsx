@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, LogRow } from "../lib/api";
-import { fmtMs, fmtTime, fmtDateTime, prettyJson, relTime, statusTone } from "../lib/format";
+import { fmtMs, fmtTime, fmtDateTime, fmtNum, prettyJson, relTime, statusTone } from "../lib/format";
 import { PageHeader } from "../App";
 import { Badge, Card, EmptyState, Spinner } from "../components/ui";
 
@@ -106,11 +106,18 @@ export default function Logs() {
                       </td>
                       <td className="px-4 py-3 font-mono text-xs text-slate-400 tabular-nums">
                         {r.input_tokens || r.output_tokens ? (
-                          <>
-                            <span className="text-accent-cyan">{r.input_tokens}</span>
-                            <span className="text-slate-600 mx-1">/</span>
-                            <span className="text-accent-green">{r.output_tokens}</span>
-                          </>
+                          <div>
+                            <div>
+                              <span className="text-accent-cyan">{r.input_tokens}</span>
+                              <span className="text-slate-600 mx-1">/</span>
+                              <span className="text-accent-green">{r.output_tokens}</span>
+                            </div>
+                            {r.cached_input_tokens > 0 && (
+                              <div className="mt-0.5 text-[10px] text-accent-green/80">
+                                缓存 {fmtNum(r.cached_input_tokens)}
+                              </div>
+                            )}
+                          </div>
                         ) : (
                           "—"
                         )}
@@ -153,6 +160,10 @@ function DetailDrawer({ id, onClose }: { id: number; onClose: () => void }) {
       .finally(() => setLoading(false));
   }, [id]);
 
+  const cacheHitRate = row?.input_tokens
+    ? ((row.cached_input_tokens ?? 0) / row.input_tokens) * 100
+    : 0;
+
   return (
     <div className="fixed inset-0 z-40 flex justify-end">
       <div
@@ -190,6 +201,14 @@ function DetailDrawer({ id, onClose }: { id: number; onClose: () => void }) {
                 <Field label="延迟" value={row.duration_ms ? fmtMs(row.duration_ms) : "—"} mono />
                 <Field label="输入 Token" value={String(row.input_tokens)} mono />
                 <Field label="输出 Token" value={String(row.output_tokens)} mono />
+                <Field label="缓存命中 Token" value={fmtNum(row.cached_input_tokens ?? 0)} mono />
+                <Field label="缓存写入 Token" value={fmtNum(row.cache_creation_input_tokens ?? 0)} mono />
+                <Field
+                  label="缓存命中率"
+                  value={`${cacheHitRate.toFixed(1)}%`}
+                  mono
+                  tone={cacheHitRate > 0 ? "text-accent-green" : "text-slate-200"}
+                />
                 <Field label="停止原因" value={row.stop_reason || "—"} mono />
                 <Field label="流式" value={row.stream ? "是" : "否"} mono />
               </div>

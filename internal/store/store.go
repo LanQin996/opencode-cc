@@ -60,6 +60,10 @@ func (s *Store) migrate() error {
 	// table across versions without a full migration framework.
 	for _, stmt := range []string{
 		`ALTER TABLE requests ADD COLUMN api_key_id INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE requests ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE requests ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE stats_hourly ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE stats_hourly ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil && !isDupColumnErr(err) {
 			return err
@@ -97,6 +101,8 @@ CREATE TABLE IF NOT EXISTS requests (
     duration_ms     INTEGER NOT NULL DEFAULT 0,
     input_tokens    INTEGER NOT NULL DEFAULT 0,
     output_tokens   INTEGER NOT NULL DEFAULT 0,
+    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
     stop_reason     TEXT    NOT NULL DEFAULT '',
     error           TEXT    NOT NULL DEFAULT '',
     req_body        TEXT    NOT NULL DEFAULT '',
@@ -110,7 +116,9 @@ CREATE TABLE IF NOT EXISTS stats_hourly (
     requests        INTEGER NOT NULL DEFAULT 0,
     errors          INTEGER NOT NULL DEFAULT 0,
     input_tokens    INTEGER NOT NULL DEFAULT 0,
-    output_tokens   INTEGER NOT NULL DEFAULT 0
+    output_tokens   INTEGER NOT NULL DEFAULT 0,
+    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -136,22 +144,24 @@ CREATE TABLE IF NOT EXISTS api_keys (
 
 // RequestRow is the Go representation of a logged request.
 type RequestRow struct {
-	ID            int64     `json:"id"`
-	Ts            time.Time `json:"ts"`
-	Method        string    `json:"method"`
-	Path          string    `json:"path"`
-	IncomingModel string    `json:"incoming_model"`
-	TargetModel   string    `json:"target_model"`
-	Stream        bool      `json:"stream"`
-	Status        int       `json:"status"`
-	DurationMs    int64     `json:"duration_ms"`
-	InputTokens   int       `json:"input_tokens"`
-	OutputTokens  int       `json:"output_tokens"`
-	StopReason    string    `json:"stop_reason"`
-	Error         string    `json:"error"`
-	ReqBody       string    `json:"req_body"`
-	RespBody      string    `json:"resp_body"`
-	APIKeyID      int64     `json:"api_key_id"`
+	ID                       int64     `json:"id"`
+	Ts                       time.Time `json:"ts"`
+	Method                   string    `json:"method"`
+	Path                     string    `json:"path"`
+	IncomingModel            string    `json:"incoming_model"`
+	TargetModel              string    `json:"target_model"`
+	Stream                   bool      `json:"stream"`
+	Status                   int       `json:"status"`
+	DurationMs               int64     `json:"duration_ms"`
+	InputTokens              int       `json:"input_tokens"`
+	OutputTokens             int       `json:"output_tokens"`
+	CachedInputTokens        int       `json:"cached_input_tokens"`
+	CacheCreationInputTokens int       `json:"cache_creation_input_tokens"`
+	StopReason               string    `json:"stop_reason"`
+	Error                    string    `json:"error"`
+	ReqBody                  string    `json:"req_body"`
+	RespBody                 string    `json:"resp_body"`
+	APIKeyID                 int64     `json:"api_key_id"`
 }
 
 // InsertRequest writes one request row and bumps the hourly stats atomically.
@@ -165,10 +175,12 @@ func (s *Store) InsertRequest(ctx context.Context, r *RequestRow) error {
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO requests
 (ts, method, path, incoming_model, target_model, stream, status, duration_ms,
- input_tokens, output_tokens, stop_reason, error, req_body, resp_body, api_key_id)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+ input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+ stop_reason, error, req_body, resp_body, api_key_id)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.Ts.UnixMilli(), r.Method, r.Path, r.IncomingModel, r.TargetModel,
 		boolToInt(r.Stream), r.Status, r.DurationMs, r.InputTokens, r.OutputTokens,
+		r.CachedInputTokens, r.CacheCreationInputTokens,
 		r.StopReason, r.Error, r.ReqBody, r.RespBody, r.APIKeyID,
 	)
 	if err != nil {
@@ -181,14 +193,16 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		errInc = 1
 	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO stats_hourly (hour, requests, errors, input_tokens, output_tokens)
-VALUES (?, 1, ?, ?, ?)
+INSERT INTO stats_hourly (hour, requests, errors, input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens)
+VALUES (?, 1, ?, ?, ?, ?, ?)
 ON CONFLICT(hour) DO UPDATE SET
     requests     = requests     + 1,
     errors       = errors       + excluded.errors,
     input_tokens = input_tokens + excluded.input_tokens,
-    output_tokens= output_tokens+ excluded.output_tokens`,
-		hour, errInc, r.InputTokens, r.OutputTokens,
+    output_tokens= output_tokens+ excluded.output_tokens,
+    cached_input_tokens = cached_input_tokens + excluded.cached_input_tokens,
+    cache_creation_input_tokens = cache_creation_input_tokens + excluded.cache_creation_input_tokens`,
+		hour, errInc, r.InputTokens, r.OutputTokens, r.CachedInputTokens, r.CacheCreationInputTokens,
 	); err != nil {
 		return fmt.Errorf("upsert stats: %w", err)
 	}
@@ -202,7 +216,8 @@ func (s *Store) ListRequests(ctx context.Context, limit int) ([]RequestRow, erro
 	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, ts, method, path, incoming_model, target_model, stream, status,
-       duration_ms, input_tokens, output_tokens, stop_reason, error, req_body, resp_body, api_key_id
+       duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+       stop_reason, error, req_body, resp_body, api_key_id
 FROM requests ORDER BY ts DESC, id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -215,13 +230,15 @@ FROM requests ORDER BY ts DESC, id DESC LIMIT ?`, limit)
 func (s *Store) GetRequest(ctx context.Context, id int64) (*RequestRow, error) {
 	row := s.db.QueryRowContext(ctx, `
 SELECT id, ts, method, path, incoming_model, target_model, stream, status,
-       duration_ms, input_tokens, output_tokens, stop_reason, error, req_body, resp_body, api_key_id
+       duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+       stop_reason, error, req_body, resp_body, api_key_id
 FROM requests WHERE id = ?`, id)
 	r := &RequestRow{}
 	var ts int64
 	var stream int
 	if err := row.Scan(&r.ID, &ts, &r.Method, &r.Path, &r.IncomingModel, &r.TargetModel,
 		&stream, &r.Status, &r.DurationMs, &r.InputTokens, &r.OutputTokens,
+		&r.CachedInputTokens, &r.CacheCreationInputTokens,
 		&r.StopReason, &r.Error, &r.ReqBody, &r.RespBody, &r.APIKeyID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -241,6 +258,7 @@ func scanRows(rows *sql.Rows) ([]RequestRow, error) {
 		var stream int
 		if err := rows.Scan(&r.ID, &ts, &r.Method, &r.Path, &r.IncomingModel, &r.TargetModel,
 			&stream, &r.Status, &r.DurationMs, &r.InputTokens, &r.OutputTokens,
+			&r.CachedInputTokens, &r.CacheCreationInputTokens,
 			&r.StopReason, &r.Error, &r.ReqBody, &r.RespBody, &r.APIKeyID); err != nil {
 			return nil, err
 		}
@@ -253,12 +271,14 @@ func scanRows(rows *sql.Rows) ([]RequestRow, error) {
 
 // StatsSummary holds aggregated numbers for the panel.
 type StatsSummary struct {
-	TotalRequests   int64 `json:"total_requests"`
-	TotalErrors     int64 `json:"total_errors"`
-	TotalInputTok   int64 `json:"total_input_tokens"`
-	TotalOutputTok  int64 `json:"total_output_tokens"`
-	RequestsLast24h int64 `json:"requests_last_24h"`
-	ErrorsLast24h   int64 `json:"errors_last_24h"`
+	TotalRequests              int64 `json:"total_requests"`
+	TotalErrors                int64 `json:"total_errors"`
+	TotalInputTok              int64 `json:"total_input_tokens"`
+	TotalOutputTok             int64 `json:"total_output_tokens"`
+	TotalCachedInputTok        int64 `json:"total_cached_input_tokens"`
+	TotalCacheCreationInputTok int64 `json:"total_cache_creation_input_tokens"`
+	RequestsLast24h            int64 `json:"requests_last_24h"`
+	ErrorsLast24h              int64 `json:"errors_last_24h"`
 }
 
 // Summary returns lifetime + last-24h aggregates.
@@ -267,10 +287,11 @@ func (s *Store) Summary(ctx context.Context) (*StatsSummary, error) {
 	row := s.db.QueryRowContext(ctx, `
 SELECT
   COALESCE(SUM(requests),0), COALESCE(SUM(errors),0),
-  COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)
+  COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+  COALESCE(SUM(cached_input_tokens),0), COALESCE(SUM(cache_creation_input_tokens),0)
 FROM stats_hourly`)
 	var sum StatsSummary
-	if err := row.Scan(&sum.TotalRequests, &sum.TotalErrors, &sum.TotalInputTok, &sum.TotalOutputTok); err != nil {
+	if err := row.Scan(&sum.TotalRequests, &sum.TotalErrors, &sum.TotalInputTok, &sum.TotalOutputTok, &sum.TotalCachedInputTok, &sum.TotalCacheCreationInputTok); err != nil {
 		return nil, err
 	}
 	row = s.db.QueryRowContext(ctx, `
@@ -284,11 +305,13 @@ FROM requests WHERE ts >= ?`, cutoff)
 
 // HourPoint is one bucket in a time series.
 type HourPoint struct {
-	Hour         int64 `json:"hour"`
-	Requests     int64 `json:"requests"`
-	Errors       int64 `json:"errors"`
-	InputTokens  int64 `json:"input_tokens"`
-	OutputTokens int64 `json:"output_tokens"`
+	Hour                     int64 `json:"hour"`
+	Requests                 int64 `json:"requests"`
+	Errors                   int64 `json:"errors"`
+	InputTokens              int64 `json:"input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+	CachedInputTokens        int64 `json:"cached_input_tokens"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 }
 
 // HourlySeries returns the per-hour series for the last `hours` hours.
@@ -298,7 +321,7 @@ func (s *Store) HourlySeries(ctx context.Context, hours int) ([]HourPoint, error
 	}
 	from := time.Now().Truncate(time.Hour).Add(-time.Duration(hours-1) * time.Hour).Unix()
 	rows, err := s.db.QueryContext(ctx, `
-SELECT hour, requests, errors, input_tokens, output_tokens
+SELECT hour, requests, errors, input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens
 FROM stats_hourly WHERE hour >= ? ORDER BY hour ASC`, from)
 	if err != nil {
 		return nil, err
@@ -307,7 +330,7 @@ FROM stats_hourly WHERE hour >= ? ORDER BY hour ASC`, from)
 	out := make([]HourPoint, 0)
 	for rows.Next() {
 		var p HourPoint
-		if err := rows.Scan(&p.Hour, &p.Requests, &p.Errors, &p.InputTokens, &p.OutputTokens); err != nil {
+		if err := rows.Scan(&p.Hour, &p.Requests, &p.Errors, &p.InputTokens, &p.OutputTokens, &p.CachedInputTokens, &p.CacheCreationInputTokens); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -317,15 +340,16 @@ FROM stats_hourly WHERE hour >= ? ORDER BY hour ASC`, from)
 
 // ModelUsagePoint tallies requests per target model.
 type ModelUsagePoint struct {
-	Model    string `json:"model"`
-	Requests int64  `json:"requests"`
-	Tokens   int64  `json:"tokens"`
+	Model             string `json:"model"`
+	Requests          int64  `json:"requests"`
+	Tokens            int64  `json:"tokens"`
+	CachedInputTokens int64  `json:"cached_input_tokens"`
 }
 
 // ModelUsage returns request/token counts grouped by target model.
 func (s *Store) ModelUsage(ctx context.Context, since int64) ([]ModelUsagePoint, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT target_model, COUNT(*) AS req_count, COALESCE(SUM(input_tokens+output_tokens),0)
+SELECT target_model, COUNT(*) AS req_count, COALESCE(SUM(input_tokens+output_tokens),0), COALESCE(SUM(cached_input_tokens),0)
 FROM requests WHERE ts >= ? GROUP BY target_model ORDER BY req_count DESC`, since)
 	if err != nil {
 		return nil, err
@@ -334,7 +358,7 @@ FROM requests WHERE ts >= ? GROUP BY target_model ORDER BY req_count DESC`, sinc
 	out := make([]ModelUsagePoint, 0)
 	for rows.Next() {
 		var p ModelUsagePoint
-		if err := rows.Scan(&p.Model, &p.Requests, &p.Tokens); err != nil {
+		if err := rows.Scan(&p.Model, &p.Requests, &p.Tokens, &p.CachedInputTokens); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

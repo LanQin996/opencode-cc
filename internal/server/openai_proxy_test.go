@@ -118,6 +118,46 @@ func TestOpenAIChatCompletionsNonStream(t *testing.T) {
 	})
 }
 
+func TestPrepareOpenAIRequestSortsTools(t *testing.T) {
+	srv, _, _ := newOpenAITestServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	upBody, incoming, target, stream, err := srv.prepareOpenAIRequest([]byte(`{
+		"model":"client-model",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[
+			{"type":"function","function":{"name":"z_tool","parameters":{"type":"object"}}},
+			{"type":"function","function":{"name":"a_tool","parameters":{"type":"object"}}},
+			{"type":"web_search"}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("prepare request: %v", err)
+	}
+	if incoming != "client-model" || target != "glm-5.1" || stream {
+		t.Fatalf("unexpected request metadata: incoming=%q target=%q stream=%v", incoming, target, stream)
+	}
+	var out struct {
+		PromptCacheKey string `json:"prompt_cache_key"`
+		Tools          []struct {
+			Type     string `json:"type"`
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(upBody, &out); err != nil {
+		t.Fatalf("decode upstream request: %v", err)
+	}
+	if !strings.HasPrefix(out.PromptCacheKey, "opencode-cc:") {
+		t.Fatalf("prompt_cache_key = %q", out.PromptCacheKey)
+	}
+	if len(out.Tools) != 3 ||
+		out.Tools[0].Function.Name != "a_tool" ||
+		out.Tools[1].Function.Name != "z_tool" ||
+		out.Tools[2].Type != "web_search" {
+		t.Fatalf("tools = %+v", out.Tools)
+	}
+}
+
 func TestOpenAIChatCompletionsStream(t *testing.T) {
 	var expected strings.Builder
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

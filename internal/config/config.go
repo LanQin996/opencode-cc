@@ -37,8 +37,12 @@ type ModelMapping struct {
 type Config struct {
 	ListenAddr string `json:"listen_addr"`
 	// UpstreamBase is the Zen base URL without a trailing slash, e.g.
-	// "https://opencode.ai/zen". Requests go to <base>/v1/chat/completions.
+	// "https://opencode.ai/zen".
 	UpstreamBase string `json:"upstream_base"`
+	// NativeAnthropic enables smart native routing. Anthropic-native target
+	// models (claude-*, qwen*) use <upstream>/v1/messages; other target models
+	// are translated through OpenAI-compatible endpoints.
+	NativeAnthropic bool `json:"native_anthropic"`
 	// ZenAPIKey is the bearer token used to authenticate against Zen.
 	ZenAPIKey string `json:"zen_api_key"`
 	// PanelToken gates access to the web panel and its API. If empty the panel
@@ -61,6 +65,18 @@ type Config struct {
 	// RequestTimeoutSeconds is the upstream timeout. 0 = no timeout (streams
 	// can run long); a sane upper bound is still recommended.
 	RequestTimeoutSeconds int `json:"request_timeout_seconds"`
+	// PromptCacheEnabled enables request normalization and upstream prompt-cache
+	// hints that improve cache hits without changing user-visible prompt text.
+	PromptCacheEnabled bool `json:"prompt_cache_enabled"`
+	// PromptCacheKeyPrefix prefixes automatically generated prompt_cache_key
+	// values for OpenAI-compatible upstream requests.
+	PromptCacheKeyPrefix string `json:"prompt_cache_key_prefix"`
+	// PromptCacheAnthropicControl adds Anthropic cache_control markers when the
+	// request has a stable system/tool prefix and no marker was provided.
+	PromptCacheAnthropicControl bool `json:"prompt_cache_anthropic_control"`
+	// PromptCacheNormalize keeps cacheable request structure stable: system
+	// messages first, sorted tools/context blocks, and volatile metadata removed.
+	PromptCacheNormalize bool `json:"prompt_cache_normalize"`
 
 	dataDir    string
 	configPath string
@@ -70,29 +86,39 @@ type Config struct {
 // Patch represents a partial update from the control panel. Pointer fields
 // distinguish omitted JSON properties from explicit zero values.
 type Patch struct {
-	ListenAddr            *string         `json:"listen_addr"`
-	UpstreamBase          *string         `json:"upstream_base"`
-	ZenAPIKey             *string         `json:"zen_api_key"`
-	PanelToken            *string         `json:"panel_token"`
-	RequireAPIKey         *bool           `json:"require_api_key"`
-	DefaultModel          *string         `json:"default_model"`
-	ModelMappings         *[]ModelMapping `json:"model_mappings"`
-	LogRequests           *bool           `json:"log_requests"`
-	MaxBodyLogBytes       *int            `json:"max_body_log_bytes"`
-	RequestTimeoutSeconds *int            `json:"request_timeout_seconds"`
+	ListenAddr                  *string         `json:"listen_addr"`
+	UpstreamBase                *string         `json:"upstream_base"`
+	NativeAnthropic             *bool           `json:"native_anthropic"`
+	ZenAPIKey                   *string         `json:"zen_api_key"`
+	PanelToken                  *string         `json:"panel_token"`
+	RequireAPIKey               *bool           `json:"require_api_key"`
+	DefaultModel                *string         `json:"default_model"`
+	ModelMappings               *[]ModelMapping `json:"model_mappings"`
+	LogRequests                 *bool           `json:"log_requests"`
+	MaxBodyLogBytes             *int            `json:"max_body_log_bytes"`
+	RequestTimeoutSeconds       *int            `json:"request_timeout_seconds"`
+	PromptCacheEnabled          *bool           `json:"prompt_cache_enabled"`
+	PromptCacheKeyPrefix        *string         `json:"prompt_cache_key_prefix"`
+	PromptCacheAnthropicControl *bool           `json:"prompt_cache_anthropic_control"`
+	PromptCacheNormalize        *bool           `json:"prompt_cache_normalize"`
 }
 
 // Default returns a Config populated with sensible defaults.
 func Default() *Config {
 	return &Config{
-		ListenAddr:            DefaultListenAddr,
-		UpstreamBase:          DefaultUpstreamBase,
-		RequireAPIKey:         false, // open by default for single-user local use
-		DefaultModel:          DefaultDefaultModel,
-		ModelMappings:         DefaultModelMappings(),
-		LogRequests:           true,
-		MaxBodyLogBytes:       1 << 14, // 16 KiB per body side
-		RequestTimeoutSeconds: 0,
+		ListenAddr:                  DefaultListenAddr,
+		UpstreamBase:                DefaultUpstreamBase,
+		NativeAnthropic:             true,
+		RequireAPIKey:               false, // open by default for single-user local use
+		DefaultModel:                DefaultDefaultModel,
+		ModelMappings:               DefaultModelMappings(),
+		LogRequests:                 true,
+		MaxBodyLogBytes:             1 << 14, // 16 KiB per body side
+		RequestTimeoutSeconds:       0,
+		PromptCacheEnabled:          true,
+		PromptCacheKeyPrefix:        "opencode-cc",
+		PromptCacheAnthropicControl: true,
+		PromptCacheNormalize:        true,
 	}
 }
 
@@ -140,6 +166,11 @@ func (c *Config) applyEnv() {
 	if v := os.Getenv("OPENCODE_CC_UPSTREAM"); v != "" {
 		c.UpstreamBase = strings.TrimRight(v, "/")
 	}
+	if v := os.Getenv("OPENCODE_CC_NATIVE_ANTHROPIC"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.NativeAnthropic = b
+		}
+	}
 	if v := os.Getenv("ZEN_API_KEY"); v != "" {
 		c.ZenAPIKey = v
 	}
@@ -162,6 +193,24 @@ func (c *Config) applyEnv() {
 	if v := os.Getenv("OPENCODE_CC_TIMEOUT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.RequestTimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("OPENCODE_CC_PROMPT_CACHE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.PromptCacheEnabled = b
+		}
+	}
+	if v := os.Getenv("OPENCODE_CC_PROMPT_CACHE_KEY_PREFIX"); v != "" {
+		c.PromptCacheKeyPrefix = v
+	}
+	if v := os.Getenv("OPENCODE_CC_PROMPT_CACHE_ANTHROPIC_CONTROL"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.PromptCacheAnthropicControl = b
+		}
+	}
+	if v := os.Getenv("OPENCODE_CC_PROMPT_CACHE_NORMALIZE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.PromptCacheNormalize = b
 		}
 	}
 }
@@ -195,15 +244,20 @@ func (c *Config) Snapshot() *Config {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	cp := &Config{
-		ListenAddr:            c.ListenAddr,
-		UpstreamBase:          c.UpstreamBase,
-		ZenAPIKey:             c.ZenAPIKey,
-		PanelToken:            c.PanelToken,
-		RequireAPIKey:         c.RequireAPIKey,
-		DefaultModel:          c.DefaultModel,
-		LogRequests:           c.LogRequests,
-		MaxBodyLogBytes:       c.MaxBodyLogBytes,
-		RequestTimeoutSeconds: c.RequestTimeoutSeconds,
+		ListenAddr:                  c.ListenAddr,
+		UpstreamBase:                c.UpstreamBase,
+		NativeAnthropic:             c.NativeAnthropic,
+		ZenAPIKey:                   c.ZenAPIKey,
+		PanelToken:                  c.PanelToken,
+		RequireAPIKey:               c.RequireAPIKey,
+		DefaultModel:                c.DefaultModel,
+		LogRequests:                 c.LogRequests,
+		MaxBodyLogBytes:             c.MaxBodyLogBytes,
+		RequestTimeoutSeconds:       c.RequestTimeoutSeconds,
+		PromptCacheEnabled:          c.PromptCacheEnabled,
+		PromptCacheKeyPrefix:        c.PromptCacheKeyPrefix,
+		PromptCacheAnthropicControl: c.PromptCacheAnthropicControl,
+		PromptCacheNormalize:        c.PromptCacheNormalize,
 	}
 	if c.ModelMappings != nil {
 		cp.ModelMappings = append([]ModelMapping(nil), c.ModelMappings...)
@@ -280,6 +334,9 @@ func (c *Config) ApplyPatch(src *Patch) {
 	if src.UpstreamBase != nil && *src.UpstreamBase != "" {
 		c.UpstreamBase = strings.TrimRight(*src.UpstreamBase, "/")
 	}
+	if src.NativeAnthropic != nil {
+		c.NativeAnthropic = *src.NativeAnthropic
+	}
 	// ZenAPIKey: empty means "don't change" so the panel never clobbers it.
 	if src.ZenAPIKey != nil && *src.ZenAPIKey != "" {
 		c.ZenAPIKey = *src.ZenAPIKey
@@ -304,5 +361,17 @@ func (c *Config) ApplyPatch(src *Patch) {
 	}
 	if src.RequestTimeoutSeconds != nil && *src.RequestTimeoutSeconds >= 0 {
 		c.RequestTimeoutSeconds = *src.RequestTimeoutSeconds
+	}
+	if src.PromptCacheEnabled != nil {
+		c.PromptCacheEnabled = *src.PromptCacheEnabled
+	}
+	if src.PromptCacheKeyPrefix != nil {
+		c.PromptCacheKeyPrefix = *src.PromptCacheKeyPrefix
+	}
+	if src.PromptCacheAnthropicControl != nil {
+		c.PromptCacheAnthropicControl = *src.PromptCacheAnthropicControl
+	}
+	if src.PromptCacheNormalize != nil {
+		c.PromptCacheNormalize = *src.PromptCacheNormalize
 	}
 }
