@@ -54,12 +54,21 @@ export interface LogRow {
   resp_body?: string;
 }
 
+export interface UpstreamView {
+  base_url: string;
+  api_key_masked: string;
+  api_key_set: boolean;
+  name: string;
+  enabled: boolean;
+}
+
 export interface PanelConfig {
   listen_addr: string;
   upstream_base: string;
   native_anthropic: boolean;
   zen_api_key_masked: string;
   zen_api_key_set: boolean;
+  upstreams: UpstreamView[];
   panel_token_set: boolean;
   require_api_key: boolean;
   default_model: string;

@@ -50,10 +50,12 @@ func (s *Server) Handler(panelAssets http.FileSystem, panelMux http.Handler) htt
 	// Codex uses the Responses API. Zen /go only exposes Chat Completions, so
 	// this route performs a bidirectional Responses <-> Chat translation.
 	mux.Handle("/v1/responses", s.clientAuth(s.ResponsesProxy()))
-	mux.Handle("/v1/models", s.clientAuth(proxy.ModelsHandler(
+	mux.Handle("/v1/models", s.clientAuth(proxy.ModelsHandlerWithUpstream(
 		s.httpClient,
-		func() string { return s.cfg.Snapshot().UpstreamBase },
-		func() string { return s.cfg.Snapshot().ZenAPIKey },
+		func() (string, string) {
+			base, key, _ := s.cfg.NextUpstream()
+			return base, key
+		},
 	)))
 
 	// ---- Panel API (mounted under /api) ----

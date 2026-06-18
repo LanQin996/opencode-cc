@@ -41,16 +41,17 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 		incomingModel := in.Model
 		targetModel := s.cfg.ResolveModel(incomingModel)
 		cfg := s.cfg.Snapshot()
-		if cfg.ZenAPIKey == "" {
-			const msg = "no Zen API key configured. Set ZEN_API_KEY or configure it in the web panel."
+		upstream, zenKey, ok := s.cfg.NextUpstream()
+		if !ok {
+			const msg = "no upstream API key configured. Set one in the web panel (Settings → upstreams)."
 			writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", msg)
 			s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
-				http.StatusUnauthorized, "no zen api key", body, time.Since(start))
+				http.StatusUnauthorized, "no upstream api key", body, time.Since(start))
 			return
 		}
 
 		if cfg.NativeAnthropic && proxy.IsNativeAnthropicModel(targetModel) {
-			s.proxyResponsesViaAnthropic(w, r, in, cfg, incomingModel, targetModel, body, start)
+			s.proxyResponsesViaAnthropic(w, r, in, cfg, upstream, zenKey, incomingModel, targetModel, body, start)
 			return
 		}
 
@@ -68,14 +69,14 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 			return
 		}
 
-		upURL := strings.TrimRight(cfg.UpstreamBase, "/") + "/v1/chat/completions"
+		upURL := strings.TrimRight(upstream, "/") + "/v1/chat/completions"
 		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
 		if err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, "api_error",
 				"could not build upstream request: "+err.Error())
 			return
 		}
-		upReq.Header.Set("Authorization", "Bearer "+cfg.ZenAPIKey)
+		upReq.Header.Set("Authorization", "Bearer "+zenKey)
 		upReq.Header.Set("Content-Type", "application/json")
 		upReq.Header.Set("User-Agent", "opencode-cc/1.2")
 		if in.Stream {
@@ -111,6 +112,7 @@ func (s *Server) proxyResponsesViaAnthropic(
 	r *http.Request,
 	in *proxy.ResponsesRequest,
 	cfg *config.Config,
+	upstream, zenKey string,
 	incomingModel, targetModel string,
 	reqBody []byte,
 	start time.Time,
@@ -133,15 +135,15 @@ func (s *Server) proxyResponsesViaAnthropic(
 		return
 	}
 
-	upURL := strings.TrimRight(cfg.UpstreamBase, "/") + "/v1/messages"
+	upURL := strings.TrimRight(upstream, "/") + "/v1/messages"
 	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "api_error",
 			"could not build upstream request: "+err.Error())
 		return
 	}
-	upReq.Header.Set("Authorization", "Bearer "+cfg.ZenAPIKey)
-	upReq.Header.Set("x-api-key", cfg.ZenAPIKey)
+	upReq.Header.Set("Authorization", "Bearer "+zenKey)
+	upReq.Header.Set("x-api-key", zenKey)
 	upReq.Header.Set("Content-Type", "application/json")
 	upReq.Header.Set("User-Agent", "opencode-cc/1.3")
 	if in.Stream {

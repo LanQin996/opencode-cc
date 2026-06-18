@@ -77,6 +77,13 @@ func newTestServer(t *testing.T, upstream string) (*Server, *store.Store) {
 	cfg.ZenAPIKey = "test-key"
 	cfg.NativeAnthropic = false
 	cfg.ModelMappings = []config.ModelMapping{{Match: "*", Target: "glm-4.6"}}
+	return newTestServerWithCfg(t, cfg)
+}
+
+// newTestServerWithCfg builds a Server from an explicit, fully-configured cfg.
+// Shared by tests that need non-default upstream setups (e.g. multi-upstream
+// round-robin).
+func newTestServerWithCfg(t *testing.T, cfg *config.Config) (*Server, *store.Store) {
 	tmp := t.TempDir()
 	st, err := store.Open(tmp + "/test.db")
 	if err != nil {
@@ -410,7 +417,7 @@ func TestProxyMissingKey(t *testing.T) {
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d: %s", rr.Code, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), "no Zen API key") {
+	if !strings.Contains(rr.Body.String(), "no upstream API key") {
 		t.Errorf("unexpected error body: %s", rr.Body.String())
 	}
 }

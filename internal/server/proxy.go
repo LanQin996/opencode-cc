@@ -37,16 +37,15 @@ func (s *Server) Proxy() http.HandlerFunc {
 
 		// Resolve target model under a short read lock.
 		cfg := s.cfg.Snapshot()
-		upstream := cfg.UpstreamBase
 		nativeAnthropic := cfg.NativeAnthropic
-		zenKey := cfg.ZenAPIKey
 		timeout := time.Duration(cfg.RequestTimeoutSeconds) * time.Second
-
 		targetModel := s.cfg.ResolveModel(areq.Model)
 
-		if zenKey == "" {
-			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "no Zen API key configured. Set ZEN_API_KEY or configure it in the web panel.")
-			s.logFailed(ctx, r, areq.Model, targetModel, areq.Stream, http.StatusUnauthorized, "no zen api key", body, time.Since(start))
+		// Pick the next upstream from the round-robin pool.
+		upstream, zenKey, ok := s.cfg.NextUpstream()
+		if !ok {
+			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "no upstream API key configured. Set one in the web panel (Settings → upstreams).")
+			s.logFailed(ctx, r, areq.Model, targetModel, areq.Stream, http.StatusUnauthorized, "no upstream api key", body, time.Since(start))
 			return
 		}
 

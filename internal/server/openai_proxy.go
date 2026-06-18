@@ -39,22 +39,23 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 		}
 
 		cfg := s.cfg.Snapshot()
-		if cfg.ZenAPIKey == "" {
-			const msg = "no Zen API key configured. Set ZEN_API_KEY or configure it in the web panel."
+		upstream, zenKey, ok := s.cfg.NextUpstream()
+		if !ok {
+			const msg = "no upstream API key configured. Set one in the web panel (Settings → upstreams)."
 			writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", msg)
 			s.logFailed(r.Context(), r, incomingModel, targetModel, stream,
-				http.StatusUnauthorized, "no zen api key", body, time.Since(start))
+				http.StatusUnauthorized, "no upstream api key", body, time.Since(start))
 			return
 		}
 
-		upURL := strings.TrimRight(cfg.UpstreamBase, "/") + "/v1/chat/completions"
+		upURL := strings.TrimRight(upstream, "/") + "/v1/chat/completions"
 		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
 		if err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, "api_error",
 				"could not build upstream request: "+err.Error())
 			return
 		}
-		upReq.Header.Set("Authorization", "Bearer "+cfg.ZenAPIKey)
+		upReq.Header.Set("Authorization", "Bearer "+zenKey)
 		upReq.Header.Set("Content-Type", "application/json")
 		upReq.Header.Set("User-Agent", "opencode-cc/1.1")
 		if stream {

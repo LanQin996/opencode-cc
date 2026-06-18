@@ -12,11 +12,20 @@ import (
 
 // testUpstream sends a minimal chat completion to the configured Zen endpoint
 // and reports whether it succeeded. Used by the panel's "Test connection"
-// button. It never streams.
+// button. It never streams. With multiple upstreams configured, it tests each
+// enabled upstream and returns a per-upstream result.
 func (a *API) testUpstream(w http.ResponseWriter, r *http.Request) {
+	// Collect the enabled upstream pool (or fall back to the legacy single pair).
 	a.cfg.RLock()
-	upstream := a.cfg.UpstreamBase
-	key := a.cfg.ZenAPIKey
+	pool := make([]upstreamProbe, 0, len(a.cfg.Upstreams))
+	for _, u := range a.cfg.Upstreams {
+		if u.Enabled && u.APIKey != "" {
+			pool = append(pool, upstreamProbe{base: u.BaseURL, key: u.APIKey, name: u.Name})
+		}
+	}
+	if len(pool) == 0 && a.cfg.UpstreamBase != "" && a.cfg.ZenAPIKey != "" {
+		pool = append(pool, upstreamProbe{base: a.cfg.UpstreamBase, key: a.cfg.ZenAPIKey})
+	}
 	defaultModel := a.cfg.DefaultModel
 	a.cfg.RUnlock()
 
@@ -28,14 +37,49 @@ func (a *API) testUpstream(w http.ResponseWriter, r *http.Request) {
 		model = "glm-4.6"
 	}
 
-	result := map[string]any{"ok": false, "model": model, "elapsed_ms": 0}
-
-	if key == "" {
-		result["error"] = "no Zen API key configured"
-		writeJSON(w, http.StatusOK, result)
+	if len(pool) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         false,
+			"model":      model,
+			"elapsed_ms": 0,
+			"error":      "no upstream API key configured",
+		})
 		return
 	}
 
+	// Test each upstream; report a list of results.
+	results := make([]map[string]any, 0, len(pool))
+	for _, up := range pool {
+		results = append(results, a.probeOne(up, model))
+	}
+	// Overall ok = all succeeded (panel can show per-upstream detail).
+	overallOK := true
+	for _, rr := range results {
+		if ok, _ := rr["ok"].(bool); !ok {
+			overallOK = false
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        overallOK,
+		"model":     model,
+		"upstreams": results,
+	})
+}
+
+// upstreamProbe is a single upstream to test.
+type upstreamProbe struct {
+	base, key, name string
+}
+
+// probeOne tests a single upstream and returns its result map.
+func (a *API) probeOne(up upstreamProbe, model string) map[string]any {
+	result := map[string]any{
+		"ok":         false,
+		"model":      model,
+		"name":       up.name,
+		"base_url":   up.base,
+		"elapsed_ms": int64(0),
+	}
 	payload := map[string]any{
 		"model":       model,
 		"max_tokens":  16,
@@ -46,15 +90,14 @@ func (a *API) testUpstream(w http.ResponseWriter, r *http.Request) {
 	}
 	b, _ := json.Marshal(payload)
 
-	url := strings.TrimRight(upstream, "/") + "/v1/chat/completions"
+	url := strings.TrimRight(up.base, "/") + "/v1/chat/completions"
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(b))
 	if err != nil {
 		result["error"] = err.Error()
-		writeJSON(w, http.StatusOK, result)
-		return
+		return result
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Authorization", "Bearer "+up.key)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	start := time.Now()
@@ -63,16 +106,14 @@ func (a *API) testUpstream(w http.ResponseWriter, r *http.Request) {
 	result["elapsed_ms"] = elapsed
 	if err != nil {
 		result["error"] = err.Error()
-		writeJSON(w, http.StatusOK, result)
-		return
+		return result
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		body, _ := readN(resp.Body, 2048)
 		result["error"] = fmt.Sprintf("upstream status %d: %s", resp.StatusCode, strings.TrimSpace(body))
-		writeJSON(w, http.StatusOK, result)
-		return
+		return result
 	}
 
 	// Decode enough to confirm a usable response.
@@ -89,8 +130,7 @@ func (a *API) testUpstream(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 		result["error"] = "could not decode response: " + err.Error()
-		writeJSON(w, http.StatusOK, result)
-		return
+		return result
 	}
 	result["ok"] = true
 	result["prompt_tokens"] = parsed.Usage.PromptTokens
@@ -98,7 +138,7 @@ func (a *API) testUpstream(w http.ResponseWriter, r *http.Request) {
 	if len(parsed.Choices) > 0 {
 		result["preview"] = truncate(parsed.Choices[0].Message.Content, 200)
 	}
-	writeJSON(w, http.StatusOK, result)
+	return result
 }
 
 func readN(r interface{ Read([]byte) (int, error) }, n int) (string, error) {

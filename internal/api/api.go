@@ -153,7 +153,7 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
 		"time":    time.Now().Format(time.RFC3339),
-		"version": "1.2.5",
+		"version": "1.2.6",
 	})
 }
 
@@ -281,13 +281,17 @@ func (a *API) configHandler(w http.ResponseWriter, r *http.Request) {
 // publicConfig masks the Zen API key so it is never echoed to the browser.
 func publicConfig(c *config.Config) map[string]any {
 	key := c.ZenAPIKey
-	masked := ""
-	if key != "" {
-		if len(key) <= 8 {
-			masked = strings.Repeat("*", len(key))
-		} else {
-			masked = key[:4] + strings.Repeat("*", len(key)-8) + key[len(key)-4:]
-		}
+	masked := maskKey(key)
+	// Build the upstreams view (masked keys) for the panel list.
+	upstreamsView := make([]map[string]any, 0, len(c.Upstreams))
+	for _, u := range c.Upstreams {
+		upstreamsView = append(upstreamsView, map[string]any{
+			"base_url":       u.BaseURL,
+			"api_key_masked": maskKey(u.APIKey),
+			"api_key_set":    u.APIKey != "",
+			"name":           u.Name,
+			"enabled":        u.Enabled,
+		})
 	}
 	return map[string]any{
 		"listen_addr":                    c.ListenAddr,
@@ -295,6 +299,7 @@ func publicConfig(c *config.Config) map[string]any {
 		"native_anthropic":               c.NativeAnthropic,
 		"zen_api_key_masked":             masked,
 		"zen_api_key_set":                key != "",
+		"upstreams":                      upstreamsView,
 		"panel_token_set":                c.PanelToken != "",
 		"require_api_key":                c.RequireAPIKey,
 		"default_model":                  c.DefaultModel,
@@ -308,6 +313,18 @@ func publicConfig(c *config.Config) map[string]any {
 		"prompt_cache_normalize":         c.PromptCacheNormalize,
 		"thinking_budget_mappings":       c.ThinkingBudgetMappings,
 	}
+}
+
+// maskKey renders a key for display without exposing it: short keys are fully
+// starred; longer ones show first 4 + stars + last 4. Empty input yields "".
+func maskKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	if len(key) <= 8 {
+		return strings.Repeat("*", len(key))
+	}
+	return key[:4] + strings.Repeat("*", len(key)-8) + key[len(key)-4:]
 }
 
 // summary returns lifetime + last-24h aggregate numbers.

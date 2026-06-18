@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Default values used when nothing else is configured.
@@ -31,6 +32,15 @@ type ModelMapping struct {
 	Match string `json:"match"`
 	// Target is the model name sent to the upstream.
 	Target string `json:"target"`
+}
+
+// Upstream is one backend (base URL + API key) the proxy can forward to.
+// Multiple upstreams form a pool that is round-robined per request.
+type Upstream struct {
+	BaseURL string `json:"base_url"` // e.g. https://opencode.ai/zen/go or https://opencode.ai/zen/
+	APIKey  string `json:"api_key"`
+	Name    string `json:"name"`    // optional human label
+	Enabled bool   `json:"enabled"` // skip when false
 }
 
 // ThinkingBudgetMapping maps Anthropic extended-thinking budgets to model-
@@ -58,6 +68,10 @@ type Config struct {
 	NativeAnthropic bool `json:"native_anthropic"`
 	// ZenAPIKey is the bearer token used to authenticate against Zen.
 	ZenAPIKey string `json:"zen_api_key"`
+	// Upstreams is the round-robin pool of backends. When non-empty it takes
+	// precedence over the legacy single UpstreamBase/ZenAPIKey fields; those
+	// are kept for backward compatibility and auto-migration.
+	Upstreams []Upstream `json:"upstreams"`
 	// PanelToken gates access to the web panel and its API. If empty the panel
 	// is open (convenient for local use). Set one before exposing the port.
 	PanelToken string `json:"panel_token"`
@@ -97,6 +111,7 @@ type Config struct {
 	dataDir    string
 	configPath string
 	mu         sync.RWMutex
+	rr         uint64 // round-robin cursor for NextUpstream (atomic)
 }
 
 // Patch represents a partial update from the control panel. Pointer fields
@@ -106,6 +121,7 @@ type Patch struct {
 	UpstreamBase                *string                  `json:"upstream_base"`
 	NativeAnthropic             *bool                    `json:"native_anthropic"`
 	ZenAPIKey                   *string                  `json:"zen_api_key"`
+	Upstreams                   *[]Upstream              `json:"upstreams"`
 	PanelToken                  *string                  `json:"panel_token"`
 	RequireAPIKey               *bool                    `json:"require_api_key"`
 	DefaultModel                *string                  `json:"default_model"`
@@ -184,7 +200,58 @@ func Load(dataDir string) (*Config, error) {
 	}
 
 	c.applyEnv()
+	c.migrateLegacyUpstream()
 	return c, nil
+}
+
+// migrateLegacyUpstream promotes the legacy single UpstreamBase + ZenAPIKey
+// pair into the Upstreams pool when the pool is empty. This makes pre-existing
+// config.json files upgrade transparently. Idempotent.
+func (c *Config) migrateLegacyUpstream() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.Upstreams) > 0 {
+		return
+	}
+	if c.UpstreamBase != "" && c.ZenAPIKey != "" {
+		c.Upstreams = []Upstream{{
+			BaseURL: strings.TrimRight(c.UpstreamBase, "/"),
+			APIKey:  c.ZenAPIKey,
+			Enabled: true,
+		}}
+	}
+}
+
+// NextUpstream returns the next backend by round-robin for a request.
+// Enabled upstreams with a non-empty key are cycled through atomically. If the
+// Upstreams pool is empty it falls back to the legacy single fields. ok is false
+// when no usable upstream is configured (the caller should respond with an
+// "upstream not configured" error).
+func (c *Config) NextUpstream() (base, key string, ok bool) {
+	c.mu.RLock()
+	// Snapshot the enabled pool under the read lock.
+	pool := make([]Upstream, 0, len(c.Upstreams))
+	for _, u := range c.Upstreams {
+		if u.Enabled && u.APIKey != "" {
+			pool = append(pool, u)
+		}
+	}
+	legacyBase, legacyKey := c.UpstreamBase, c.ZenAPIKey
+	c.mu.RUnlock()
+
+	if len(pool) == 0 {
+		if legacyBase != "" && legacyKey != "" {
+			return strings.TrimRight(legacyBase, "/"), legacyKey, true
+		}
+		return "", "", false
+	}
+	// Atomic round-robin: advance the cursor and pick modulo the pool size.
+	// AddUint64 returns the new value; we use (old+1) % n to spread the first
+	// pick across callers.
+	n := uint64(len(pool))
+	idx := atomic.AddUint64(&c.rr, 1) % n
+	u := pool[idx]
+	return strings.TrimRight(u.BaseURL, "/"), u.APIKey, true
 }
 
 // applyEnv overlays environment variables on top of the loaded config.
@@ -277,6 +344,7 @@ func (c *Config) Snapshot() *Config {
 		UpstreamBase:                c.UpstreamBase,
 		NativeAnthropic:             c.NativeAnthropic,
 		ZenAPIKey:                   c.ZenAPIKey,
+		Upstreams:                   append([]Upstream(nil), c.Upstreams...),
 		PanelToken:                  c.PanelToken,
 		RequireAPIKey:               c.RequireAPIKey,
 		DefaultModel:                c.DefaultModel,
@@ -386,6 +454,21 @@ func (c *Config) ApplyPatch(src *Patch) {
 	// ZenAPIKey: empty means "don't change" so the panel never clobbers it.
 	if src.ZenAPIKey != nil && *src.ZenAPIKey != "" {
 		c.ZenAPIKey = *src.ZenAPIKey
+	}
+	// Upstreams pool: when provided, replace wholesale. Per-item APIKey uses
+	// the "empty = keep existing key" sentinel so masked edits don't wipe keys.
+	if src.Upstreams != nil {
+		next := *src.Upstreams
+		// Preserve existing keys where the patch left them blank, matching by
+		// position (the panel sends the full ordered list back).
+		prev := c.Upstreams
+		for i := range next {
+			if next[i].APIKey == "" && i < len(prev) && prev[i].APIKey != "" {
+				next[i].APIKey = prev[i].APIKey
+			}
+			next[i].BaseURL = strings.TrimRight(next[i].BaseURL, "/")
+		}
+		c.Upstreams = next
 	}
 	if src.PanelToken != nil {
 		c.PanelToken = *src.PanelToken

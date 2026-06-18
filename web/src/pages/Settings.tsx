@@ -1,12 +1,27 @@
 import { useEffect, useState } from "react";
-import { api, PanelConfig } from "../lib/api";
+import { api, PanelConfig, UpstreamView } from "../lib/api";
 import { PageHeader } from "../App";
 import { Badge, Card, Spinner } from "../components/ui";
 
+// One editable upstream row. api_key is the local edit buffer (empty = keep
+// existing, matches the backend "empty = don't change" sentinel).
+interface UpstreamRow {
+  base_url: string;
+  api_key: string;
+  name: string;
+  enabled: boolean;
+  api_key_set: boolean;
+  api_key_masked: string;
+}
+
+const ZEN_BASES = [
+  "https://opencode.ai/zen/go",
+  "https://opencode.ai/zen/",
+];
+
 export default function Settings() {
   const [cfg, setCfg] = useState<PanelConfig | null>(null);
-  const [apiKey, setApiKey] = useState("");
-  const [upstream, setUpstream] = useState("https://opencode.ai/zen");
+  const [upstreams, setUpstreams] = useState<UpstreamRow[]>([]);
   const [nativeAnthropic, setNativeAnthropic] = useState(false);
   const [logReqs, setLogReqs] = useState(true);
   const [maxBody, setMaxBody] = useState(16384);
@@ -29,7 +44,6 @@ export default function Settings() {
   useEffect(() => {
     api.getConfig().then((c) => {
       setCfg(c);
-      setUpstream(c.upstream_base);
       setNativeAnthropic(c.native_anthropic);
       setLogReqs(c.log_requests);
       setMaxBody(c.max_body_log_bytes);
@@ -39,6 +53,16 @@ export default function Settings() {
       setPromptCacheKeyPrefix(c.prompt_cache_key_prefix || "opencode-cc");
       setPromptCacheAnthropicControl(c.prompt_cache_anthropic_control);
       setPromptCacheNormalize(c.prompt_cache_normalize);
+      // Seed the upstreams editor from the server view.
+      const rows: UpstreamRow[] = (c.upstreams && c.upstreams.length ? c.upstreams : []).map((u) => ({
+        base_url: u.base_url,
+        api_key: "",
+        name: u.name,
+        enabled: u.enabled,
+        api_key_set: u.api_key_set,
+        api_key_masked: u.api_key_masked,
+      }));
+      setUpstreams(rows);
     });
   }, []);
 
@@ -67,7 +91,6 @@ export default function Settings() {
     setSaving(true);
     try {
       const body: Record<string, unknown> = {
-        upstream_base: upstream,
         native_anthropic: nativeAnthropic,
         log_requests: logReqs,
         max_body_log_bytes: maxBody,
@@ -77,18 +100,52 @@ export default function Settings() {
         prompt_cache_key_prefix: promptCacheKeyPrefix,
         prompt_cache_anthropic_control: promptCacheAnthropicControl,
         prompt_cache_normalize: promptCacheNormalize,
+        upstreams: upstreams.map((u) => ({
+          base_url: u.base_url,
+          // empty api_key = keep existing (backend sentinel); only send typed value
+          api_key: u.api_key.trim(),
+          name: u.name,
+          enabled: u.enabled,
+        })),
       };
-      // Only send the API key if the user typed a new one.
-      if (apiKey.trim()) body.zen_api_key = apiKey.trim();
       const updated = await api.putConfig(body);
       setCfg(updated);
-      setApiKey("");
+      // Refresh masked key views from the server response.
+      if (updated.upstreams) {
+        setUpstreams(
+          updated.upstreams.map((u) => ({
+            base_url: u.base_url,
+            api_key: "",
+            name: u.name,
+            enabled: u.enabled,
+            api_key_set: u.api_key_set,
+            api_key_masked: u.api_key_masked,
+          }))
+        );
+      }
       setDirty(false);
       setFlash("已保存。");
       setTimeout(() => setFlash(""), 2500);
     } finally {
       setSaving(false);
     }
+  }
+
+  // Upstream editor helpers
+  function updateUpstream(i: number, patch: Partial<UpstreamRow>) {
+    setUpstreams((prev) => prev.map((u, idx) => (idx === i ? { ...u, ...patch } : u)));
+    setDirty(true);
+  }
+  function addUpstream() {
+    setUpstreams((prev) => [
+      ...prev,
+      { base_url: ZEN_BASES[0], api_key: "", name: "", enabled: true, api_key_set: false, api_key_masked: "" },
+    ]);
+    setDirty(true);
+  }
+  function removeUpstream(i: number) {
+    setUpstreams((prev) => prev.filter((_, idx) => idx !== i));
+    setDirty(true);
   }
 
   if (!cfg) {
@@ -98,8 +155,6 @@ export default function Settings() {
       </div>
     );
   }
-
-  const keyMasked = cfg.zen_api_key_set ? cfg.zen_api_key_masked : "not set";
 
   return (
     <div className="animate-fade-in max-w-3xl">
@@ -118,44 +173,115 @@ export default function Settings() {
       />
 
       <Card className="mb-4">
-        <div className="flex items-center gap-2 mb-4">
-          <KeyIcon />
-          <h3 className="text-sm font-semibold text-slate-200">OpenCode Zen 凭据</h3>
-          {cfg.zen_api_key_set ? <Badge tone="green">已配置</Badge> : <Badge tone="amber">必填</Badge>}
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2">
+            <KeyIcon />
+            <h3 className="text-sm font-semibold text-slate-200">上游凭据（轮询）</h3>
+            {upstreams.filter((u) => u.enabled && (u.api_key_set || u.api_key.trim())).length > 0 ? (
+              <Badge tone="green">{upstreams.filter((u) => u.enabled && (u.api_key_set || u.api_key.trim())).length} 个可用</Badge>
+            ) : (
+              <Badge tone="amber">未配置</Badge>
+            )}
+          </div>
+          <button onClick={addUpstream} className="btn-ghost !py-1.5 !text-xs">
+            + 添加上游
+          </button>
         </div>
 
-        <label className="label">API Key</label>
-        <div className="flex gap-2 mb-1">
-          <input
-            type="password"
-            className="input font-mono"
-            placeholder={cfg.zen_api_key_set ? `当前：${keyMasked}` : "粘贴你的 Zen API Key"}
-            value={apiKey}
-            onChange={(e) => {
-              setApiKey(e.target.value);
-              setDirty(true);
-            }}
-          />
-        </div>
         <p className="text-xs text-slate-500 mb-4">
-          从 <span className="font-mono text-slate-400">opencode.ai/zen</span> 获取。仅本地保存在
-          <span className="font-mono text-slate-400"> data/config.json</span>，除转发给 Zen 外不会发送到任何地方。
+          支持多个上游 API Key 按请求轮询。Base URL 可从下拉选预设（
+          <span className="font-mono text-slate-400">/zen/go</span> go 套餐、
+          <span className="font-mono text-slate-400">/zen/</span> 默认），或选「自定义」填任意 OpenAI 兼容端点。Key 仅本地保存，除转发给上游外不会外发。
         </p>
 
-        <label className="label">上游 Base URL</label>
-        <input
-          className="input font-mono"
-          value={upstream}
-          onChange={(e) => {
-            setUpstream(e.target.value);
-            setDirty(true);
-          }}
-        />
-        <p className="text-xs text-slate-500 mt-2">
-          开启智能原生路由时，Claude/Qwen 目标模型会发送到{" "}
-          <span className="font-mono text-slate-400">{upstream.replace(/\/$/, "")}/v1/messages</span>
-          ，其它目标模型仍会走转换接口。
-        </p>
+        {upstreams.length === 0 ? (
+          <div className="text-sm text-slate-500 py-4 text-center">
+            还没有上游。点击「+ 添加上游」开始配置。
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {upstreams.map((u, i) => (
+              <div key={i} className="rounded-xl bg-white/[0.03] border border-white/[0.05] p-3">
+                <div className="flex items-start gap-3">
+                  <div className="flex-1 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <div>
+                      <label className="label">Base URL</label>
+                      <select
+                        className="input font-mono mb-2"
+                        value={ZEN_BASES.includes(u.base_url) ? u.base_url : "__custom__"}
+                        onChange={(e) => {
+                          if (e.target.value === "__custom__") {
+                            // Switch to custom mode with a blank URL if it was a preset.
+                            if (ZEN_BASES.includes(u.base_url)) {
+                              updateUpstream(i, { base_url: "" });
+                            }
+                            return;
+                          }
+                          updateUpstream(i, { base_url: e.target.value });
+                        }}
+                      >
+                        {ZEN_BASES.map((b) => (
+                          <option key={b} value={b}>{b}</option>
+                        ))}
+                        <option value="__custom__">
+                          {ZEN_BASES.includes(u.base_url) ? "自定义…" : "自定义（编辑下方）"}
+                        </option>
+                      </select>
+                      {!ZEN_BASES.includes(u.base_url) && (
+                        <input
+                          className="input font-mono"
+                          placeholder="https://your-custom-host/v1"
+                          value={u.base_url}
+                          onChange={(e) => updateUpstream(i, { base_url: e.target.value.trim() })}
+                        />
+                      )}
+                    </div>
+                    <div>
+                      <label className="label">备注名</label>
+                      <input
+                        className="input"
+                        placeholder="例如：go 套餐主号"
+                        value={u.name}
+                        onChange={(e) => updateUpstream(i, { name: e.target.value })}
+                      />
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => removeUpstream(i)}
+                    className="btn-ghost !px-2.5 !py-2 text-slate-500 hover:text-accent-red shrink-0 mt-5"
+                    title="删除"
+                  >
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </button>
+                </div>
+                <div className="mt-2 flex items-center gap-2">
+                  <div className="flex-1">
+                    <label className="label">API Key {u.api_key_set ? `（当前：${u.api_key_masked}）` : ""}</label>
+                    <input
+                      type="password"
+                      className="input font-mono"
+                      placeholder={u.api_key_set ? "留空保持不变，或输入新 Key 替换" : "粘贴你的 Zen API Key"}
+                      value={u.api_key}
+                      onChange={(e) => updateUpstream(i, { api_key: e.target.value })}
+                    />
+                  </div>
+                  <label className="flex items-center gap-2 cursor-pointer mt-5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => updateUpstream(i, { enabled: !u.enabled })}
+                      className={`relative w-11 h-6 rounded-full transition-colors ${u.enabled ? "bg-accent" : "bg-ink-600"}`}
+                    >
+                      <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${u.enabled ? "translate-x-5" : ""}`} />
+                    </button>
+                    <span className="text-xs text-slate-400">启用</span>
+                  </label>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </Card>
 
       <Card className="mb-4">

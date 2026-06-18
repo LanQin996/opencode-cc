@@ -73,6 +73,15 @@ func fetchZenModels(client *http.Client, base, apiKey string) ([]AnthropicModelI
 // (Zen) models. It caches the result for a minute so we don't hit Zen on every
 // call. If the upstream is unreachable it returns a minimal fallback list.
 func ModelsHandler(client *http.Client, upstreamBase, apiKey func() string) http.HandlerFunc {
+	return ModelsHandlerWithUpstream(client, func() (string, string) {
+		return upstreamBase(), apiKey()
+	})
+}
+
+// ModelsHandlerWithUpstream is like ModelsHandler but obtains the upstream base
+// URL and API key as one pair. Use this when the caller selects from a rotating
+// upstream pool, so the base URL and key cannot drift apart between callbacks.
+func ModelsHandlerWithUpstream(client *http.Client, upstream func() (base, apiKey string)) http.HandlerFunc {
 	var (
 		cache    []AnthropicModelInfo
 		cachedAt time.Time
@@ -85,9 +94,9 @@ func ModelsHandler(client *http.Client, upstreamBase, apiKey func() string) http
 			return
 		}
 		// Fetch live from upstream.
-		base := upstreamBase()
+		base, key := upstream()
 		if base != "" && client != nil {
-			if models, err := fetchZenModels(client, base, apiKey()); err == nil && len(models) > 0 {
+			if models, err := fetchZenModels(client, base, key); err == nil && len(models) > 0 {
 				cache = models
 				cachedAt = time.Now()
 			}
