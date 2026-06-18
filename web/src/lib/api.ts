@@ -99,11 +99,12 @@ export interface PanelConfig {
 export interface TestResult {
   ok: boolean;
   model: string;
-  elapsed_ms: number;
+  elapsed_ms?: number;
   prompt_tokens?: number;
   completion_tokens?: number;
   preview?: string;
   error?: string;
+  upstreams?: TestResult[];
 }
 
 export interface APIKey {

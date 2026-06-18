@@ -275,6 +275,7 @@ func TestProxyAppliesThinkingObjectForGLM(t *testing.T) {
 		Thinking *struct {
 			Type          string `json:"type"`
 			ClearThinking *bool  `json:"clear_thinking"`
+			BudgetTokens  *int   `json:"budget_tokens"`
 		} `json:"thinking"`
 	}
 	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -318,12 +319,69 @@ func TestProxyAppliesThinkingObjectForGLM(t *testing.T) {
 	}
 	if got.Thinking == nil ||
 		got.Thinking.Type != "enabled" ||
-		got.Thinking.ClearThinking == nil ||
-		*got.Thinking.ClearThinking {
+		got.Thinking.ClearThinking != nil ||
+		got.Thinking.BudgetTokens != nil {
 		t.Fatalf("thinking object was not applied for GLM: %+v", got.Thinking)
 	}
 	if !strings.Contains(rec.Body.String(), `"type":"thinking"`) {
 		t.Fatalf("reasoning_content was not returned as Anthropic thinking: %s", rec.Body.String())
+	}
+}
+
+func TestProxyMapsGLMThinkingBudgetWithoutClearThinking(t *testing.T) {
+	var got struct {
+		Model    string `json:"model"`
+		Thinking *struct {
+			Type          string `json:"type"`
+			BudgetTokens  *int   `json:"budget_tokens"`
+			ClearThinking *bool  `json:"clear_thinking"`
+		} `json:"thinking"`
+	}
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"chatcmpl-glm-budget",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
+		}`)
+	}))
+	defer zen.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamBase = zen.URL
+	cfg.ZenAPIKey = "test-key"
+	cfg.NativeAnthropic = false
+	cfg.ModelMappings = []config.ModelMapping{{Match: "*", Target: ""}}
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	srv := New(cfg, st)
+
+	body := []byte(`{
+		"model":"glm-5.2",
+		"max_tokens":256,
+		"thinking":{"type":"enabled","budget_tokens":4096},
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Proxy().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got.Model != "glm-5.2" || got.Thinking == nil || got.Thinking.Type != "enabled" {
+		t.Fatalf("thinking object was not applied for GLM: %+v", got)
+	}
+	if got.Thinking.BudgetTokens == nil || *got.Thinking.BudgetTokens != 4096 {
+		t.Fatalf("budget_tokens = %v, want 4096", got.Thinking.BudgetTokens)
+	}
+	if got.Thinking.ClearThinking != nil {
+		t.Fatalf("clear_thinking should be omitted, got %+v", got.Thinking.ClearThinking)
 	}
 }
 

@@ -19,6 +19,7 @@ func TestResponsesNonStream(t *testing.T) {
 		Thinking *struct {
 			Type          string `json:"type"`
 			ClearThinking *bool  `json:"clear_thinking"`
+			BudgetTokens  *int   `json:"budget_tokens"`
 		} `json:"thinking"`
 		Messages []struct {
 			Role    string `json:"role"`
@@ -61,8 +62,8 @@ func TestResponsesNonStream(t *testing.T) {
 	}
 	if upstreamBody.Thinking == nil ||
 		upstreamBody.Thinking.Type != "enabled" ||
-		upstreamBody.Thinking.ClearThinking == nil ||
-		*upstreamBody.Thinking.ClearThinking {
+		upstreamBody.Thinking.ClearThinking != nil ||
+		upstreamBody.Thinking.BudgetTokens != nil {
 		t.Fatalf("GLM thinking object not applied: %+v", upstreamBody.Thinking)
 	}
 	if len(upstreamBody.Messages) != 2 || upstreamBody.Messages[0].Role != "system" {

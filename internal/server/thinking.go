@@ -29,8 +29,8 @@ func applyThinkingBudgetMapping(req *proxy.OpenAIRequest, areq *proxy.AnthropicR
 	switch strings.ToLower(mapping.Field) {
 	case "thinking":
 		req.Thinking = &proxy.OpenAIThinking{Type: thinkingType}
-		if thinkingType == "enabled" {
-			req.Thinking.ClearThinking = boolRef(false)
+		if thinkingType == "enabled" && budgetTokens > 0 {
+			req.Thinking.BudgetTokens = &budgetTokens
 		}
 	case "thinking_budget":
 		if thinkingType != "enabled" {
@@ -58,8 +58,7 @@ func applyResponsesThinkingMapping(req *proxy.OpenAIRequest, targetModel string,
 		return
 	}
 	req.Thinking = &proxy.OpenAIThinking{
-		Type:          "enabled",
-		ClearThinking: boolRef(false),
+		Type: "enabled",
 	}
 }
 
