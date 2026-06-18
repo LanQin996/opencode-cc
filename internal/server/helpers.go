@@ -5,6 +5,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 )
 
 // writeJSON writes v as JSON with the given status. Shared by handlers in this
@@ -37,4 +38,11 @@ func writeOpenAIError(w http.ResponseWriter, status int, errType, msg string) {
 			"code":    nil,
 		},
 	})
+}
+
+func (s *Server) upstreamClient(stream bool, timeoutSeconds int) *http.Client {
+	if stream || timeoutSeconds <= 0 {
+		return s.httpClient
+	}
+	return &http.Client{Timeout: time.Duration(timeoutSeconds) * time.Second}
 }

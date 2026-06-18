@@ -64,10 +64,7 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 			upReq.Header.Set("Accept", "application/json")
 		}
 
-		httpClient := s.httpClient
-		if cfg.RequestTimeoutSeconds > 0 {
-			httpClient = &http.Client{Timeout: time.Duration(cfg.RequestTimeoutSeconds) * time.Second}
-		}
+		httpClient := s.upstreamClient(stream, cfg.RequestTimeoutSeconds)
 		resp, err := httpClient.Do(upReq)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())

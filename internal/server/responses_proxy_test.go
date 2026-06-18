@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kiowx/opencode-cc/internal/config"
 	"github.com/Kiowx/opencode-cc/internal/store"
@@ -177,6 +178,75 @@ func TestResponsesStream(t *testing.T) {
 			row.OutputTokens == 1 &&
 			row.StopReason == "stop"
 	})
+}
+
+func TestResponsesStreamReportsPrematureEOF(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, `data: {"id":"chatcmpl-stream","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	})
+	_, _, httpSrv := newOpenAITestServer(t, upstream)
+
+	body := `{
+		"model":"client-model",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Say OK"}]}],
+		"stream":true
+	}`
+	resp, err := http.Post(httpSrv.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	out := string(raw)
+	if !strings.Contains(out, "event: response.failed") {
+		t.Fatalf("premature EOF was not reported as failed:\n%s", out)
+	}
+	if strings.Contains(out, "event: response.completed") {
+		t.Fatalf("premature EOF was incorrectly completed:\n%s", out)
+	}
+}
+
+func TestResponsesStreamIgnoresConfiguredBodyTimeout(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, `data: {"id":"chatcmpl-stream","choices":[{"index":0,"delta":{"content":"slow"},"finish_reason":null}]}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		time.Sleep(1200 * time.Millisecond)
+		_, _ = fmt.Fprint(w, `data: {"id":"chatcmpl-stream","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\n")
+		_, _ = fmt.Fprint(w, `data: {"id":"chatcmpl-stream","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	})
+	srv, _, httpSrv := newOpenAITestServer(t, upstream)
+	srv.cfg.RequestTimeoutSeconds = 1
+
+	body := `{
+		"model":"client-model",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Say OK"}]}],
+		"stream":true
+	}`
+	resp, err := http.Post(httpSrv.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	out := string(raw)
+	if !strings.Contains(out, "event: response.completed") {
+		t.Fatalf("slow stream was not completed:\n%s", out)
+	}
+	if strings.Contains(out, "event: response.failed") {
+		t.Fatalf("slow stream was incorrectly failed:\n%s", out)
+	}
 }
 
 func TestResponsesNativeAnthropicNonStream(t *testing.T) {

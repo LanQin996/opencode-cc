@@ -85,10 +85,7 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 			upReq.Header.Set("Accept", "application/json")
 		}
 
-		httpClient := s.httpClient
-		if cfg.RequestTimeoutSeconds > 0 {
-			httpClient = &http.Client{Timeout: time.Duration(cfg.RequestTimeoutSeconds) * time.Second}
-		}
+		httpClient := s.upstreamClient(in.Stream, cfg.RequestTimeoutSeconds)
 		resp, err := httpClient.Do(upReq)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
@@ -160,10 +157,7 @@ func (s *Server) proxyResponsesViaAnthropic(
 		upReq.Header.Set("anthropic-beta", beta)
 	}
 
-	httpClient := s.httpClient
-	if cfg.RequestTimeoutSeconds > 0 {
-		httpClient = &http.Client{Timeout: time.Duration(cfg.RequestTimeoutSeconds) * time.Second}
-	}
+	httpClient := s.upstreamClient(in.Stream, cfg.RequestTimeoutSeconds)
 	resp, err := httpClient.Do(upReq)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
@@ -344,7 +338,7 @@ func (s *Server) relayResponsesStream(
 	}
 	flusher.Flush()
 
-	scanErr := proxy.ScanOpenAIStream(reader, func(chunk *proxy.OpenAIStreamChunk) error {
+	scanResult, scanErr := proxy.ScanOpenAIStreamWithStatus(reader, func(chunk *proxy.OpenAIStreamChunk) error {
 		if err := converter.HandleChunk(chunk); err != nil {
 			return err
 		}
@@ -356,6 +350,14 @@ func (s *Server) relayResponsesStream(
 		flusher.Flush()
 		s.logFailed(r.Context(), r, incomingModel, targetModel, true,
 			http.StatusBadGateway, scanErr.Error(), reqBody, time.Since(start))
+		return
+	}
+	if !scanResult.SawDone && !scanResult.SawFinish {
+		const msg = "upstream stream ended before finish_reason or [DONE]"
+		_ = converter.EmitError(msg)
+		flusher.Flush()
+		s.logFailed(r.Context(), r, incomingModel, targetModel, true,
+			http.StatusBadGateway, msg, reqBody, time.Since(start))
 		return
 	}
 	if err := converter.Finalize(); err != nil {
@@ -415,6 +417,7 @@ func (s *Server) relayResponsesAnthropicStream(
 
 	var inputTokens, outputTokens int
 	var cachedInputTokens, cacheCreationInputTokens int
+	var sawAnthropicStop bool
 	scanErr := scanAnthropicSSE(reader, func(event string, data []byte) error {
 		var payload struct {
 			Type    string `json:"type"`
@@ -502,8 +505,11 @@ func (s *Server) relayResponsesAnthropicStream(
 				converter.SetUsage(inputTokens, outputTokens)
 			}
 			if payload.Delta != nil && payload.Delta.StopReason != nil {
+				sawAnthropicStop = true
 				converter.SetFinishReason(openAIFinishReasonFromAnthropic(*payload.Delta.StopReason))
 			}
+		case "message_stop":
+			sawAnthropicStop = true
 		}
 		flusher.Flush()
 		return nil
@@ -513,6 +519,14 @@ func (s *Server) relayResponsesAnthropicStream(
 		flusher.Flush()
 		s.logFailed(r.Context(), r, incomingModel, targetModel, true,
 			http.StatusBadGateway, scanErr.Error(), reqBody, time.Since(start))
+		return
+	}
+	if !sawAnthropicStop {
+		const msg = "upstream Anthropic stream ended before message_stop"
+		_ = converter.EmitError(msg)
+		flusher.Flush()
+		s.logFailed(r.Context(), r, incomingModel, targetModel, true,
+			http.StatusBadGateway, msg, reqBody, time.Since(start))
 		return
 	}
 	if err := converter.Finalize(); err != nil {

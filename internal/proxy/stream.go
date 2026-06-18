@@ -216,15 +216,30 @@ func (c *StreamConverter) HandleChunk(chunk *OpenAIStreamChunk) error {
 		}
 		// 3. Tool call deltas.
 		for _, tc := range ch.Delta.ToolCalls {
-			if !c.toolAllowed(tc.Function.Name) {
+			name, ok := c.canonicalToolName(tc.Function.Name)
+			if !ok {
 				continue
 			}
+			tc.Function.Name = name
 			if err := c.handleToolCall(tc); err != nil {
 				return err
 			}
 		}
+		// Legacy OpenAI-compatible providers may stream function_call instead
+		// of tool_calls. Treat it as a single function tool call.
+		if ch.Delta.FunctionCall != nil {
+			tc := OpenAIToolCall{Type: "function", Function: *ch.Delta.FunctionCall}
+			name, ok := c.canonicalToolName(tc.Function.Name)
+			if ok {
+				tc.Function.Name = name
+				if err := c.handleToolCall(tc); err != nil {
+					return err
+				}
+			}
+		}
 		// 4. Role-only first delta (no content) — nothing to emit.
-		if ch.Delta.Role != "" && ch.Delta.Content == "" && len(ch.Delta.ToolCalls) == 0 {
+		if ch.Delta.Role != "" && ch.Delta.Content == "" &&
+			len(ch.Delta.ToolCalls) == 0 && ch.Delta.FunctionCall == nil {
 			continue
 		}
 		// 5. Finish reason — remember it; we finalize at stream end so the
@@ -346,17 +361,24 @@ func (c *StreamConverter) handleToolCall(tc OpenAIToolCall) error {
 	return nil
 }
 
-func (c *StreamConverter) toolAllowed(name string) bool {
+func (c *StreamConverter) canonicalToolName(name string) (string, bool) {
 	if !c.restrictTools {
-		return true
+		return name, true
 	}
 	if name == "" {
 		// Empty names are continuation deltas and are only valid while an
 		// accepted tool block is already open.
-		return c.cur != nil && c.cur.kind == "tool_use"
+		return "", c.cur != nil && c.cur.kind == "tool_use"
 	}
-	_, ok := c.allowedTools[name]
-	return ok
+	if _, ok := c.allowedTools[name]; ok {
+		return name, true
+	}
+	for allowed := range c.allowedTools {
+		if strings.EqualFold(allowed, name) {
+			return allowed, true
+		}
+	}
+	return "", false
 }
 
 // closeCurrent emits content_block_stop for the active block, if any.
@@ -448,17 +470,27 @@ func (c *StreamConverter) writeEvent(event string, payload any) error {
 
 // ---- Upstream SSE parser ----
 
+type OpenAIStreamScanResult struct {
+	SawChunk  bool
+	SawDone   bool
+	SawFinish bool
+}
+
 // ScanOpenAIStream reads an OpenAI SSE stream from r and invokes onChunk for
 // each decoded chunk. It returns io.EOF when the stream terminates cleanly.
 // Some OpenAI-compatible upstreams end the HTTP stream without a final
 // "data: [DONE]"; if at least one valid chunk was seen, that is accepted as a
 // clean EOF.
 func ScanOpenAIStream(r io.Reader, onChunk func(*OpenAIStreamChunk) error) error {
+	_, err := ScanOpenAIStreamWithStatus(r, onChunk)
+	return err
+}
+
+func ScanOpenAIStreamWithStatus(r io.Reader, onChunk func(*OpenAIStreamChunk) error) (OpenAIStreamScanResult, error) {
 	sc := bufio.NewScanner(r)
 	// Some upstreams send very large chunks; bump the buffer.
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-	var sawDone bool
-	var sawChunk bool
+	var result OpenAIStreamScanResult
 	for sc.Scan() {
 		line := sc.Text()
 		if line == "" {
@@ -470,7 +502,7 @@ func ScanOpenAIStream(r io.Reader, onChunk func(*OpenAIStreamChunk) error) error
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
-			sawDone = true
+			result.SawDone = true
 			break
 		}
 		var chunk OpenAIStreamChunk
@@ -478,16 +510,21 @@ func ScanOpenAIStream(r io.Reader, onChunk func(*OpenAIStreamChunk) error) error
 			// Skip malformed line rather than killing the whole stream.
 			continue
 		}
-		sawChunk = true
+		result.SawChunk = true
+		for _, choice := range chunk.Choices {
+			if choice.FinishReason != nil && *choice.FinishReason != "" {
+				result.SawFinish = true
+			}
+		}
 		if err := onChunk(&chunk); err != nil {
-			return err
+			return result, err
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return err
+		return result, err
 	}
-	if !sawDone && !sawChunk {
-		return errors.New("upstream stream ended without [DONE]")
+	if !result.SawDone && !result.SawChunk {
+		return result, errors.New("upstream stream ended without [DONE]")
 	}
-	return io.EOF
+	return result, io.EOF
 }

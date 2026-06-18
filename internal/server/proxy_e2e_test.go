@@ -479,6 +479,61 @@ func TestProxyNonStreamFiltersUndeclaredToolCall(t *testing.T) {
 	}
 }
 
+func TestProxyNonStreamCanonicalizesDeclaredToolName(t *testing.T) {
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-task",
+			"choices": []map[string]any{{
+				"index": 0,
+				"message": map[string]any{
+					"role": "assistant",
+					"tool_calls": []map[string]any{{
+						"id":   "call_task",
+						"type": "function",
+						"function": map[string]any{
+							"name":      "task",
+							"arguments": map[string]any{"description": "check", "prompt": "inspect"},
+						},
+					}},
+				},
+				"finish_reason": "tool_calls",
+			}},
+			"usage": map[string]any{},
+		})
+	}))
+	defer zen.Close()
+	srv, _ := newTestServer(t, zen.URL)
+
+	body := []byte(`{
+		"model":"glm-5.2",
+		"max_tokens":256,
+		"tools":[{"name":"Task","input_schema":{"type":"object","properties":{"description":{"type":"string"},"prompt":{"type":"string"}}}}],
+		"messages":[{"role":"user","content":"use subagent"}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.Proxy().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp proxy.AnthropicResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Content) != 1 || resp.Content[0].Type != "tool_use" {
+		t.Fatalf("content = %+v, want one tool_use", resp.Content)
+	}
+	if resp.Content[0].Name != "Task" {
+		t.Fatalf("tool name = %q, want Task", resp.Content[0].Name)
+	}
+	if resp.StopReason == nil || *resp.StopReason != "tool_use" {
+		t.Fatalf("stop_reason = %v, want tool_use", resp.StopReason)
+	}
+	if string(resp.Content[0].Input) != `{"description":"check","prompt":"inspect"}` {
+		t.Fatalf("tool input = %s", resp.Content[0].Input)
+	}
+}
+
 func TestProxyAuthenticatedUsageIsRecorded(t *testing.T) {
 	zen := mockZen(t, false, nil)
 	srv, st := newTestServer(t, zen.URL)

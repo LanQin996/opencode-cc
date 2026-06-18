@@ -1,5 +1,10 @@
 package proxy
 
+import (
+	"encoding/json"
+	"strings"
+)
+
 // OpenAI Chat Completions types — the format we send to Zen and receive from
 // it. Only the fields needed for conversion are modelled.
 
@@ -35,12 +40,13 @@ type OpenAIStreamOptions struct {
 
 // OpenAIMessage is one chat message.
 type OpenAIMessage struct {
-	Role             string           `json:"role"`
-	Content          any              `json:"content,omitempty"` // string or []OpenAIContentPart
-	ReasoningContent string           `json:"reasoning_content,omitempty"`
-	ToolCalls        []OpenAIToolCall `json:"tool_calls,omitempty"`
-	ToolCallID       string           `json:"tool_call_id,omitempty"`
-	Name             string           `json:"name,omitempty"`
+	Role             string              `json:"role"`
+	Content          any                 `json:"content,omitempty"` // string or []OpenAIContentPart
+	ReasoningContent string              `json:"reasoning_content,omitempty"`
+	ToolCalls        []OpenAIToolCall    `json:"tool_calls,omitempty"`
+	FunctionCall     *OpenAIFunctionCall `json:"function_call,omitempty"`
+	ToolCallID       string              `json:"tool_call_id,omitempty"`
+	Name             string              `json:"name,omitempty"`
 }
 
 // OpenAIContentPart is one part of a multi-part message (images / text).
@@ -68,6 +74,32 @@ type OpenAIToolCall struct {
 type OpenAIFunctionCall struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"` // JSON string
+}
+
+func (f *OpenAIFunctionCall) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	f.Name = raw.Name
+	f.Arguments = ""
+	if len(raw.Arguments) == 0 || strings.TrimSpace(string(raw.Arguments)) == "null" {
+		return nil
+	}
+	var args string
+	if err := json.Unmarshal(raw.Arguments, &args); err == nil {
+		f.Arguments = args
+		return nil
+	}
+	if canonical, ok := canonicalJSON(raw.Arguments); ok {
+		f.Arguments = string(canonical)
+		return nil
+	}
+	f.Arguments = strings.TrimSpace(string(raw.Arguments))
+	return nil
 }
 
 // OpenAITool is a tool definition in the request.
@@ -104,10 +136,11 @@ type OpenAIChoice struct {
 
 // OpenAIDelta is the streaming delta.
 type OpenAIDelta struct {
-	Role             string           `json:"role,omitempty"`
-	Content          string           `json:"content,omitempty"`
-	ReasoningContent string           `json:"reasoning_content,omitempty"`
-	ToolCalls        []OpenAIToolCall `json:"tool_calls,omitempty"`
+	Role             string              `json:"role,omitempty"`
+	Content          string              `json:"content,omitempty"`
+	ReasoningContent string              `json:"reasoning_content,omitempty"`
+	ToolCalls        []OpenAIToolCall    `json:"tool_calls,omitempty"`
+	FunctionCall     *OpenAIFunctionCall `json:"function_call,omitempty"`
 }
 
 // OpenAIUsage is the usage block.

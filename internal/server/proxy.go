@@ -38,7 +38,7 @@ func (s *Server) Proxy() http.HandlerFunc {
 		// Resolve target model under a short read lock.
 		cfg := s.cfg.Snapshot()
 		nativeAnthropic := cfg.NativeAnthropic
-		timeout := time.Duration(cfg.RequestTimeoutSeconds) * time.Second
+		timeoutSeconds := cfg.RequestTimeoutSeconds
 		targetModel := s.cfg.ResolveModel(areq.Model)
 
 		// Pick the next upstream from the round-robin pool.
@@ -50,7 +50,7 @@ func (s *Server) Proxy() http.HandlerFunc {
 		}
 
 		if nativeAnthropic && proxy.IsNativeAnthropicModel(targetModel) {
-			s.proxyNativeAnthropic(w, r, body, &areq, upstream, zenKey, targetModel, timeout, start)
+			s.proxyNativeAnthropic(w, r, body, &areq, upstream, zenKey, targetModel, timeoutSeconds, start)
 			return
 		}
 
@@ -90,10 +90,7 @@ func (s *Server) Proxy() http.HandlerFunc {
 			upReq.Header.Set("anthropic-version", v)
 		}
 
-		httpClient := s.httpClient
-		if timeout > 0 {
-			httpClient = &http.Client{Timeout: timeout}
-		}
+		httpClient := s.upstreamClient(areq.Stream, timeoutSeconds)
 
 		resp, err := httpClient.Do(upReq)
 		if err != nil {
@@ -122,7 +119,7 @@ func (s *Server) proxyNativeAnthropic(
 	body []byte,
 	areq *proxy.AnthropicRequest,
 	upstream, zenKey, targetModel string,
-	timeout time.Duration,
+	timeoutSeconds int,
 	start time.Time,
 ) {
 	upBody, err := proxy.PrepareAnthropicPromptCacheBody(body, targetModel, promptCacheOptionsFromConfig(s.cfg.Snapshot()))
@@ -155,10 +152,7 @@ func (s *Server) proxyNativeAnthropic(
 		upReq.Header.Set("anthropic-beta", beta)
 	}
 
-	httpClient := s.httpClient
-	if timeout > 0 {
-		httpClient = &http.Client{Timeout: timeout}
-	}
+	httpClient := s.upstreamClient(areq.Stream, timeoutSeconds)
 	resp, err := httpClient.Do(upReq)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
@@ -644,18 +638,20 @@ func filterUndeclaredToolUses(resp *proxy.AnthropicResponse, tools []proxy.Anthr
 	if resp == nil {
 		return
 	}
-	allowed := make(map[string]struct{}, len(tools))
+	allowed := make(map[string]string, len(tools))
 	for _, tool := range tools {
-		allowed[tool.Name] = struct{}{}
+		allowed[tool.Name] = tool.Name
 	}
 	filtered := resp.Content[:0]
 	removed := false
 	for _, block := range resp.Content {
 		if block.Type == "tool_use" {
-			if _, ok := allowed[block.Name]; !ok {
+			name, ok := canonicalDeclaredToolName(block.Name, allowed)
+			if !ok {
 				removed = true
 				continue
 			}
+			block.Name = name
 		}
 		filtered = append(filtered, block)
 	}
@@ -664,6 +660,18 @@ func filterUndeclaredToolUses(resp *proxy.AnthropicResponse, tools []proxy.Anthr
 		stop := "end_turn"
 		resp.StopReason = &stop
 	}
+}
+
+func canonicalDeclaredToolName(name string, allowed map[string]string) (string, bool) {
+	if canonical, ok := allowed[name]; ok {
+		return canonical, true
+	}
+	for allowedName, canonical := range allowed {
+		if strings.EqualFold(allowedName, name) {
+			return canonical, true
+		}
+	}
+	return "", false
 }
 
 // extractOpenAIError pulls the human message out of an OpenAI error envelope.

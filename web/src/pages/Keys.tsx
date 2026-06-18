@@ -161,6 +161,10 @@ function KeyRow({
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-mono text-sm text-slate-200">{k.key_prefix}…</span>
             {k.enabled ? <Badge tone="green">启用</Badge> : <Badge tone="red">已停用</Badge>}
+            {(() => {
+              const e = expiryBadge(k.expires_at);
+              return e ? <Badge tone={e.tone}>{e.text}</Badge> : null;
+            })()}
             {k.name && <span className="text-sm text-slate-400">· {k.name}</span>}
           </div>
           <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs text-slate-500">
@@ -245,8 +249,37 @@ function KeyModal({
   );
   const [saving, setSaving] = useState(false);
 
+  // Expiry editor state: derive a friendly mode from the epoch value.
+  // modes: "never" | "days" | "date"
+  const [expMode, setExpMode] = useState<"never" | "days" | "date">(() => {
+    if (!form.expires_at) return "never";
+    return "date";
+  });
+  const [expDays, setExpDays] = useState<number>(30);
+  // datetime-local expects yyyy-MM-ddTHH:mm in LOCAL time.
+  const [expDate, setExpDate] = useState<string>(() => {
+    if (!form.expires_at) return "";
+    const d = new Date(form.expires_at * 1000);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  });
+
   function set<K extends keyof KeyBody>(key: K, val: KeyBody[K]) {
     setForm((f) => ({ ...f, [key]: val }));
+  }
+
+  // Recompute expires_at from the chosen mode whenever the mode/inputs change.
+  function commitExpiry(mode: "never" | "days" | "date", days = expDays, date = expDate) {
+    setExpMode(mode);
+    if (mode === "never") {
+      set("expires_at", 0);
+    } else if (mode === "days") {
+      const ts = Math.floor(Date.now() / 1000) + Math.max(1, Math.floor(days)) * 86400;
+      set("expires_at", ts);
+    } else {
+      const t = new Date(date).getTime();
+      set("expires_at", isNaN(t) ? 0 : Math.floor(t / 1000));
+    }
   }
 
   async function submit() {
@@ -299,6 +332,58 @@ function KeyModal({
               <label className="label">每日请求限额（0=不限）</label>
               <input type="number" min={0} className="input font-mono" value={form.daily_request_limit} onChange={(e) => set("daily_request_limit", Number(e.target.value))} />
             </div>
+          </div>
+
+          <div>
+            <label className="label">有效期</label>
+            <div className="flex gap-2 flex-wrap items-center">
+              <select
+                className="input !w-auto"
+                value={expMode}
+                onChange={(e) => {
+                  const m = e.target.value as "never" | "days" | "date";
+                  if (m === "never") commitExpiry("never");
+                  else if (m === "days") commitExpiry("days", 30);
+                  else commitExpiry("date", expDays, expDate || tomorrowLocal());
+                }}
+              >
+                <option value="never">永久有效</option>
+                <option value="days">N 天后过期</option>
+                <option value="date">指定日期</option>
+              </select>
+              {expMode === "days" && (
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={1}
+                    className="input font-mono !w-24"
+                    value={expDays}
+                    onChange={(e) => {
+                      const n = Number(e.target.value);
+                      setExpDays(n);
+                      commitExpiry("days", n);
+                    }}
+                  />
+                  <span className="text-xs text-slate-500">天</span>
+                </div>
+              )}
+              {expMode === "date" && (
+                <input
+                  type="datetime-local"
+                  className="input font-mono !w-auto"
+                  value={expDate}
+                  onChange={(e) => {
+                    setExpDate(e.target.value);
+                    commitExpiry("date", expDays, e.target.value);
+                  }}
+                />
+              )}
+            </div>
+            <p className="text-xs text-slate-500 mt-1.5">
+              {form.expires_at
+                ? `将于 ${new Date(form.expires_at * 1000).toLocaleString()} 过期`
+                : "此密钥不会过期。"}
+            </p>
           </div>
 
           <div>
@@ -362,4 +447,30 @@ function PlusIcon() {
       <path d="M12 5v14M5 12h14" strokeLinecap="round" />
     </svg>
   );
+}
+
+// tomorrowLocal returns a yyyy-MM-ddTHH:mm string for ~24h from now, used as a
+// sensible default when switching to the "specific date" expiry mode.
+function tomorrowLocal(): string {
+  const d = new Date(Date.now() + 24 * 3600 * 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// expiryBadge returns a {text, tone} descriptor for a key's expiry state, or
+// null when the key never expires.
+function expiryBadge(expiresAt: number): { text: string; tone: "amber" | "red" | "cyan" } | null {
+  if (!expiresAt) return null;
+  const now = Date.now();
+  const exp = expiresAt * 1000;
+  const diff = exp - now;
+  if (diff <= 0) return { text: "已过期", tone: "red" };
+  if (diff < 24 * 3600 * 1000) return { text: `${Math.max(1, Math.floor(diff / 3600000))}小时后过期`, tone: "red" };
+  const days = Math.floor(diff / (24 * 3600 * 1000));
+  if (days <= 7) return { text: `${days}天后过期`, tone: "amber" };
+  const d = new Date(exp);
+  return {
+    text: `${d.getMonth() + 1}/${d.getDate()} 到期`,
+    tone: "cyan",
+  };
 }

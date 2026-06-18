@@ -148,6 +148,61 @@ func TestStreamConversionRejectsUndeclaredToolCalls(t *testing.T) {
 	}
 }
 
+func TestOpenAIFunctionCallAcceptsJSONObjectArguments(t *testing.T) {
+	var fc OpenAIFunctionCall
+	if err := json.Unmarshal([]byte(`{"name":"Task","arguments":{"prompt":"inspect","description":"check"}}`), &fc); err != nil {
+		t.Fatal(err)
+	}
+	if fc.Name != "Task" {
+		t.Fatalf("name = %q, want Task", fc.Name)
+	}
+	if fc.Arguments != `{"description":"check","prompt":"inspect"}` {
+		t.Fatalf("arguments = %q", fc.Arguments)
+	}
+}
+
+func TestStreamConversionAcceptsLegacyFunctionCallAndCanonicalToolName(t *testing.T) {
+	var out bytes.Buffer
+	conv, err := NewStreamConverter(&out, "claude-test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.RestrictTools([]string{"Task"})
+
+	if err := conv.HandleChunk(&OpenAIStreamChunk{Choices: []OpenAIChoice{{
+		Delta: OpenAIDelta{FunctionCall: &OpenAIFunctionCall{
+			Name:      "task",
+			Arguments: `{"description":"check","prompt":"inspect"}`,
+		}},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	finish := "function_call"
+	if err := conv.HandleChunk(&OpenAIStreamChunk{Choices: []OpenAIChoice{{
+		FinishReason: &finish,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.Finalize("end_turn"); err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := out.String()
+	for _, want := range []string{
+		`"type":"tool_use"`,
+		`"name":"Task"`,
+		`"partial_json":"{\"description\":\"check\",\"prompt\":\"inspect\"}"`,
+		`"stop_reason":"tool_use"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q\n---OUTPUT---\n%s", want, got)
+		}
+	}
+}
+
 // TestNonStreamConversion checks the non-streaming path end to end.
 func TestNonStreamConversion(t *testing.T) {
 	up := &OpenAIResponse{

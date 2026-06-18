@@ -44,6 +44,12 @@ func ConvertResponse(in *OpenAIResponse, requestModel string) *AnthropicResponse
 		for _, tc := range choice.Message.ToolCalls {
 			out.Content = append(out.Content, toolCallToBlock(tc))
 		}
+		if choice.Message.FunctionCall != nil {
+			out.Content = append(out.Content, toolCallToBlock(OpenAIToolCall{
+				Type:     "function",
+				Function: *choice.Message.FunctionCall,
+			}))
+		}
 	}
 
 	out.StopReason = finishReasonToStop(choice.FinishReason)
