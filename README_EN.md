@@ -180,7 +180,23 @@ make dev   # Vite on :5174 and Go on :8787, with API requests proxied by Vite
 ### Docker
 
 Images are published to GitHub Container Registry as `ghcr.io/kiowx/opencode-cc`.
-The included `docker-compose.yml` stores configuration and SQLite data in a named volume.
+
+**One-command deployment** (no clone required; replace the API key and panel password):
+
+```bash
+docker run -d --name opencode-cc --restart unless-stopped \
+  -p 8787:8787 \
+  -v opencode-cc-data:/data \
+  -e ZEN_API_KEY=sk-your-key \
+  -e OPENCODE_CC_PANEL_TOKEN=your-panel-password \
+  ghcr.io/kiowx/opencode-cc:latest
+```
+
+Open `http://your-server-ip:8787` and sign in with `OPENCODE_CC_PANEL_TOKEN`. The
+`opencode-cc-data` named volume persists configuration and SQLite data. Setting a panel password
+is strongly recommended whenever the port is exposed beyond localhost.
+
+The included `docker-compose.yml` provides the same persistent setup:
 
 ```bash
 docker compose up -d
@@ -194,8 +210,15 @@ docker compose up -d
 docker image prune -f
 ```
 
-To pin a release, change the image tag in `docker-compose.yml` from `latest` to a version such
-as `1.2.8`. To build locally instead:
+For a deployment created with `docker run`, update it with:
+
+```bash
+docker pull ghcr.io/kiowx/opencode-cc:latest
+docker rm -f opencode-cc
+# Re-run the one-command deployment above
+```
+
+Replace `latest` with a version such as `1.2.8` to pin a release. To build locally instead:
 
 ```bash
 docker build -t opencode-cc .

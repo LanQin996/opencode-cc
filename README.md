@@ -145,8 +145,24 @@ make dev   # Vite 跑在 :5174 + Go 跑在 :8787，API 通过 Vite 代理
 
 ### Docker
 
-项目镜像发布到 GitHub Container Registry：`ghcr.io/kiowx/opencode-cc`。仓库中的
-`docker-compose.yml` 使用命名卷保存配置和 SQLite 数据。
+镜像发布到 GitHub Container Registry：`ghcr.io/kiowx/opencode-cc`。
+
+**一键运行**（无需 clone 仓库；请替换 API key 和面板密码）：
+
+```bash
+docker run -d --name opencode-cc --restart unless-stopped \
+  -p 8787:8787 \
+  -v opencode-cc-data:/data \
+  -e ZEN_API_KEY=sk-你的key \
+  -e OPENCODE_CC_PANEL_TOKEN=你的面板密码 \
+  ghcr.io/kiowx/opencode-cc:latest
+```
+
+启动后访问 `http://服务器IP:8787`，使用 `OPENCODE_CC_PANEL_TOKEN` 登录。命名卷
+`opencode-cc-data` 会持久化配置和 SQLite 数据。对外开放端口时强烈建议设置面板密码，
+否则任何能访问该地址的人都可以打开控制面板。
+
+仓库中的 `docker-compose.yml` 提供相同的持久化配置：
 
 ```bash
 docker compose up -d
@@ -160,8 +176,15 @@ docker compose up -d
 docker image prune -f
 ```
 
-也可以固定到某个版本，将 `docker-compose.yml` 中的镜像标签从 `latest` 改为例如
-`1.2.8`。如需本地构建：
+使用 `docker run` 部署时，更新命令为：
+
+```bash
+docker pull ghcr.io/kiowx/opencode-cc:latest
+docker rm -f opencode-cc
+# 再执行上面的一键运行命令
+```
+
+也可以把镜像标签从 `latest` 改为例如 `1.2.8` 来固定版本。如需本地构建：
 
 ```bash
 docker build -t opencode-cc .
