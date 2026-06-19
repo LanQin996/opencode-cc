@@ -179,10 +179,32 @@ make dev   # Vite on :5174 and Go on :8787, with API requests proxied by Vite
 
 ### Docker
 
+Images are published to GitHub Container Registry as `ghcr.io/kiowx/opencode-cc`.
+The included `docker-compose.yml` stores configuration and SQLite data in a named volume.
+
 ```bash
-make docker
-docker run -p 8787:8787 -v $PWD/data:/data opencode-cc
+docker compose up -d
 ```
+
+To update to the latest image:
+
+```bash
+docker compose pull
+docker compose up -d
+docker image prune -f
+```
+
+To pin a release, change the image tag in `docker-compose.yml` from `latest` to a version such
+as `1.2.8`. To build locally instead:
+
+```bash
+docker build -t opencode-cc .
+docker run -d --name opencode-cc -p 8787:8787 -v opencode-cc-data:/data opencode-cc
+```
+
+Every pushed `v*` tag publishes Linux amd64/arm64 images and refreshes the exact version,
+major/minor, major, and `latest` tags. After the first publish, set the GHCR package visibility
+to Public in GitHub Packages to allow anonymous pulls.
 
 ## How Translation Works
 

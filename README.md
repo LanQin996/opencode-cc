@@ -145,10 +145,32 @@ make dev   # Vite 跑在 :5174 + Go 跑在 :8787，API 通过 Vite 代理
 
 ### Docker
 
+项目镜像发布到 GitHub Container Registry：`ghcr.io/kiowx/opencode-cc`。仓库中的
+`docker-compose.yml` 使用命名卷保存配置和 SQLite 数据。
+
 ```bash
-make docker
-docker run -p 8787:8787 -v $PWD/data:/data opencode-cc
+docker compose up -d
 ```
+
+更新到最新版本：
+
+```bash
+docker compose pull
+docker compose up -d
+docker image prune -f
+```
+
+也可以固定到某个版本，将 `docker-compose.yml` 中的镜像标签从 `latest` 改为例如
+`1.2.8`。如需本地构建：
+
+```bash
+docker build -t opencode-cc .
+docker run -d --name opencode-cc -p 8787:8787 -v opencode-cc-data:/data opencode-cc
+```
+
+每次推送 `v*` 标签时，GitHub Actions 会自动发布 Linux amd64/arm64 镜像，并更新
+版本号、主次版本号和 `latest` 标签。GHCR 包首次发布后需在 GitHub Packages 设置中
+将可见性改为 Public，才能匿名拉取。
 
 ## 翻译原理
 

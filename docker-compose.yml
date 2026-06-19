@@ -1,0 +1,14 @@
+name: opencode-cc
+
+services:
+  opencode-cc:
+    image: ghcr.io/kiowx/opencode-cc:latest
+    container_name: opencode-cc
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - opencode-cc-data:/data
+
+volumes:
+  opencode-cc-data:
