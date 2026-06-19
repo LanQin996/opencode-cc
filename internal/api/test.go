@@ -47,23 +47,53 @@ func (a *API) testUpstream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Test each upstream; report a list of results.
+	// Test each upstream; report a list of results. The top-level fields are
+	// kept for the UI's single-result display; upstreams carries the detailed
+	// per-account breakdown.
+	start := time.Now()
 	results := make([]map[string]any, 0, len(pool))
 	for _, up := range pool {
 		results = append(results, a.probeOne(up, model))
 	}
+	elapsed := time.Since(start).Milliseconds()
 	// Overall ok = all succeeded (panel can show per-upstream detail).
 	overallOK := true
+	var preview string
+	var firstErr string
+	var promptTokens, completionTokens int
 	for _, rr := range results {
 		if ok, _ := rr["ok"].(bool); !ok {
 			overallOK = false
+			if firstErr == "" {
+				firstErr, _ = rr["error"].(string)
+			}
+			continue
+		}
+		if preview == "" {
+			preview, _ = rr["preview"].(string)
+		}
+		if n, ok := rr["prompt_tokens"].(int); ok {
+			promptTokens += n
+		}
+		if n, ok := rr["completion_tokens"].(int); ok {
+			completionTokens += n
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":        overallOK,
-		"model":     model,
-		"upstreams": results,
-	})
+	out := map[string]any{
+		"ok":                overallOK,
+		"model":             model,
+		"elapsed_ms":        elapsed,
+		"prompt_tokens":     promptTokens,
+		"completion_tokens": completionTokens,
+		"upstreams":         results,
+	}
+	if preview != "" {
+		out["preview"] = preview
+	}
+	if firstErr != "" {
+		out["error"] = firstErr
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // upstreamProbe is a single upstream to test.

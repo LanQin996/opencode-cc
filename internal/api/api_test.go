@@ -209,3 +209,51 @@ func TestPanelTokenChangeInvalidatesSessions(t *testing.T) {
 		t.Fatalf("old session status = %d, want 401", checkRec.Code)
 	}
 }
+
+func TestTestUpstreamIncludesTopLevelElapsed(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("path = %q, want /v1/chat/completions", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"choices":[{"message":{"content":"pong"}}],
+			"usage":{"prompt_tokens":1,"completion_tokens":2}
+		}`))
+	}))
+	defer upstream.Close()
+
+	cfg := config.Default()
+	cfg.Upstreams = []config.Upstream{{BaseURL: upstream.URL, APIKey: "test-key", Enabled: true}}
+	mux := newTestAPI(t, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/test?model=glm-4.6", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		OK               bool `json:"ok"`
+		ElapsedMS        *int `json:"elapsed_ms"`
+		PromptTokens     int  `json:"prompt_tokens"`
+		CompletionTokens int  `json:"completion_tokens"`
+		Upstreams        []struct {
+			OK        bool `json:"ok"`
+			ElapsedMS int  `json:"elapsed_ms"`
+		} `json:"upstreams"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !out.OK || out.ElapsedMS == nil || *out.ElapsedMS < 0 {
+		t.Fatalf("top-level result missing elapsed/ok: %+v", out)
+	}
+	if out.PromptTokens != 1 || out.CompletionTokens != 2 {
+		t.Fatalf("usage = %d/%d, want 1/2", out.PromptTokens, out.CompletionTokens)
+	}
+	if len(out.Upstreams) != 1 || !out.Upstreams[0].OK || out.Upstreams[0].ElapsedMS < 0 {
+		t.Fatalf("upstreams result wrong: %+v", out.Upstreams)
+	}
+}

@@ -30,6 +30,7 @@ type OpenAIRequest struct {
 // OpenAIThinking carries provider-specific thinking controls used by GLM.
 type OpenAIThinking struct {
 	Type          string `json:"type"`
+	BudgetTokens  *int   `json:"budget_tokens,omitempty"`
 	ClearThinking *bool  `json:"clear_thinking,omitempty"`
 }
 

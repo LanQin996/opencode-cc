@@ -207,8 +207,8 @@ function ConnectButton({ model }: { model: string }) {
         <div className="flex items-center gap-2">
           {res.ok ? (
             <Badge tone="green">
-              正常 · {fmtMs(res.elapsed_ms)}
-              {res.preview ? ` · "${res.preview.slice(0, 24)}"` : ""}
+              正常 · {fmtMs(res.elapsed_ms ?? res.upstreams?.[0]?.elapsed_ms)}
+              {(res.preview || res.upstreams?.[0]?.preview) ? ` · "${(res.preview || res.upstreams?.[0]?.preview || "").slice(0, 24)}"` : ""}
             </Badge>
           ) : (
             <Badge tone="red">
