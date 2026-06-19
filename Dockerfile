@@ -28,10 +28,10 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     go build -trimpath -ldflags="-s -w" -o /out/opencode-cc .
 RUN mkdir -p /out/data
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12
 
 COPY --from=build /out/opencode-cc /opencode-cc
-COPY --from=build --chown=65532:65532 /out/data /data
+COPY --from=build /out/data /data
 
 EXPOSE 8787
 VOLUME ["/data"]
