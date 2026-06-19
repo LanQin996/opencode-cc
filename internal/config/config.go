@@ -17,12 +17,11 @@ import (
 
 // Default values used when nothing else is configured.
 const (
-	DefaultListenAddr            = ":8787"
-	DefaultUpstreamBase          = "https://opencode.ai/zen"
-	DefaultDefaultModel          = "glm-4.6"
-	DefaultDataDir               = "data"
-	DefaultConfigFile            = "config.json"
-	DefaultOpenCodeGoWorkspaceID = "Default"
+	DefaultListenAddr   = ":8787"
+	DefaultUpstreamBase = "https://opencode.ai/zen"
+	DefaultDefaultModel = "glm-4.6"
+	DefaultDataDir      = "data"
+	DefaultConfigFile   = "config.json"
 )
 
 // ModelMapping maps an incoming Anthropic model name (often "claude-*") to the
@@ -42,12 +41,6 @@ type Upstream struct {
 	APIKey  string `json:"api_key"`
 	Name    string `json:"name"`    // optional human label
 	Enabled bool   `json:"enabled"` // skip when false
-	// Optional OpenCode Go dashboard credentials used only for quota display.
-	OpenCodeGoWorkspaceID string `json:"opencode_go_workspace_id,omitempty"`
-	OpenCodeGoAuthCookie  string `json:"opencode_go_auth_cookie,omitempty"`
-	OpenCodeGoShowRolling *bool  `json:"opencode_go_show_rolling,omitempty"`
-	OpenCodeGoShowWeekly  *bool  `json:"opencode_go_show_weekly,omitempty"`
-	OpenCodeGoShowMonthly *bool  `json:"opencode_go_show_monthly,omitempty"`
 }
 
 // ThinkingBudgetMapping maps Anthropic extended-thinking budgets to model-
@@ -222,13 +215,9 @@ func (c *Config) migrateLegacyUpstream() {
 	}
 	if c.UpstreamBase != "" && c.ZenAPIKey != "" {
 		c.Upstreams = []Upstream{{
-			BaseURL:               strings.TrimRight(c.UpstreamBase, "/"),
-			APIKey:                c.ZenAPIKey,
-			Enabled:               true,
-			OpenCodeGoWorkspaceID: DefaultOpenCodeGoWorkspaceID,
-			OpenCodeGoShowRolling: boolPtr(true),
-			OpenCodeGoShowWeekly:  boolPtr(true),
-			OpenCodeGoShowMonthly: boolPtr(true),
+			BaseURL: strings.TrimRight(c.UpstreamBase, "/"),
+			APIKey:  c.ZenAPIKey,
+			Enabled: true,
 		}}
 	}
 }
@@ -471,27 +460,13 @@ func (c *Config) ApplyPatch(src *Patch) {
 	if src.Upstreams != nil {
 		next := *src.Upstreams
 		// Preserve existing keys where the patch left them blank, matching by
-		// position (the panel sends the full ordered list back). OpenCode Go
-		// auth cookies use the same sentinel so masked edits don't wipe secrets.
+		// position (the panel sends the full ordered list back).
 		prev := c.Upstreams
 		for i := range next {
 			if next[i].APIKey == "" && i < len(prev) && prev[i].APIKey != "" {
 				next[i].APIKey = prev[i].APIKey
 			}
-			if next[i].OpenCodeGoAuthCookie == "" && i < len(prev) && prev[i].OpenCodeGoAuthCookie != "" {
-				next[i].OpenCodeGoAuthCookie = prev[i].OpenCodeGoAuthCookie
-			}
-			if next[i].OpenCodeGoShowRolling == nil && i < len(prev) {
-				next[i].OpenCodeGoShowRolling = prev[i].OpenCodeGoShowRolling
-			}
-			if next[i].OpenCodeGoShowWeekly == nil && i < len(prev) {
-				next[i].OpenCodeGoShowWeekly = prev[i].OpenCodeGoShowWeekly
-			}
-			if next[i].OpenCodeGoShowMonthly == nil && i < len(prev) {
-				next[i].OpenCodeGoShowMonthly = prev[i].OpenCodeGoShowMonthly
-			}
 			next[i].BaseURL = strings.TrimRight(next[i].BaseURL, "/")
-			next[i].OpenCodeGoWorkspaceID = defaultOpenCodeGoWorkspaceID(next[i].OpenCodeGoWorkspaceID)
 		}
 		c.Upstreams = cloneUpstreams(next)
 	}
@@ -533,33 +508,9 @@ func (c *Config) ApplyPatch(src *Patch) {
 	}
 }
 
-func boolPtr(v bool) *bool { return &v }
-
-func defaultOpenCodeGoWorkspaceID(workspaceID string) string {
-	ws := strings.TrimSpace(workspaceID)
-	if ws == "" {
-		return DefaultOpenCodeGoWorkspaceID
-	}
-	return ws
-}
-
-func cloneBoolPtr(v *bool) *bool {
-	if v == nil {
-		return nil
-	}
-	cp := *v
-	return &cp
-}
-
 func cloneUpstreams(in []Upstream) []Upstream {
 	if in == nil {
 		return nil
 	}
-	out := append([]Upstream(nil), in...)
-	for i := range out {
-		out[i].OpenCodeGoShowRolling = cloneBoolPtr(in[i].OpenCodeGoShowRolling)
-		out[i].OpenCodeGoShowWeekly = cloneBoolPtr(in[i].OpenCodeGoShowWeekly)
-		out[i].OpenCodeGoShowMonthly = cloneBoolPtr(in[i].OpenCodeGoShowMonthly)
-	}
-	return out
+	return append([]Upstream(nil), in...)
 }
