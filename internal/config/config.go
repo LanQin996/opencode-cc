@@ -271,11 +271,18 @@ func (c *Config) migrateLegacyUpstream() {
 // an unavailable upstream. Once the cooldown expires, the upstream naturally
 // becomes eligible again.
 func (c *Config) NextUpstream() (UpstreamSelection, bool) {
+	return c.NextUpstreamExcluding(nil)
+}
+
+// NextUpstreamExcluding is like NextUpstream but skips upstream IDs already
+// tried by the current client request.
+func (c *Config) NextUpstreamExcluding(exclude map[string]bool) (UpstreamSelection, bool) {
 	c.mu.RLock()
 	// Snapshot the enabled pool under the read lock.
 	pool := make([]Upstream, 0, len(c.Upstreams))
+	hasUpstreamPool := len(c.Upstreams) > 0
 	for _, u := range c.Upstreams {
-		if u.Enabled && u.APIKey != "" {
+		if u.Enabled && u.APIKey != "" && !exclude[upstreamRuntimeID(u)] {
 			pool = append(pool, u)
 		}
 	}
@@ -283,11 +290,14 @@ func (c *Config) NextUpstream() (UpstreamSelection, bool) {
 	c.mu.RUnlock()
 
 	if len(pool) == 0 {
-		if legacyBase != "" && legacyKey != "" {
+		if !hasUpstreamPool && legacyBase != "" && legacyKey != "" {
 			sel := UpstreamSelection{
 				ID:      legacyUpstreamID(legacyBase, legacyKey),
 				BaseURL: strings.TrimRight(legacyBase, "/"),
 				APIKey:  legacyKey,
+			}
+			if exclude[sel.ID] {
+				return UpstreamSelection{}, false
 			}
 			if c.selectionCooling(sel, time.Now()) {
 				return UpstreamSelection{}, false
@@ -314,6 +324,14 @@ func (c *Config) NextUpstream() (UpstreamSelection, bool) {
 func (c *Config) HasConfiguredUpstream() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if len(c.Upstreams) > 0 {
+		for _, u := range c.Upstreams {
+			if u.Enabled && u.APIKey != "" {
+				return true
+			}
+		}
+		return false
+	}
 	for _, u := range c.Upstreams {
 		if u.Enabled && u.APIKey != "" {
 			return true

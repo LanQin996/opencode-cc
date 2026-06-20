@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kiowx/opencode-cc/internal/config"
 	"github.com/Kiowx/opencode-cc/internal/proxy"
 )
 
@@ -39,46 +40,32 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 		}
 
 		cfg := s.cfg.Snapshot()
-		upstream, ok := s.cfg.NextUpstream()
-		if !ok {
-			status, errType, msg := s.noUpstreamError()
-			writeOpenAIError(w, status, errType, msg)
+		resp, _, upstreamFailure := s.doUpstreamWithRetry(
+			r,
+			stream,
+			cfg.RequestTimeoutSeconds,
+			func(upstream config.UpstreamSelection) (*http.Request, error) {
+				upURL := strings.TrimRight(upstream.BaseURL, "/") + "/v1/chat/completions"
+				upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
+				if err != nil {
+					return nil, err
+				}
+				upReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
+				upReq.Header.Set("Content-Type", "application/json")
+				upReq.Header.Set("User-Agent", "opencode-cc/1.1")
+				if stream {
+					upReq.Header.Set("Accept", "text/event-stream")
+				} else {
+					upReq.Header.Set("Accept", "application/json")
+				}
+				return upReq, nil
+			},
+		)
+		if upstreamFailure != nil {
+			writeOpenAIError(w, upstreamFailure.Status, upstreamFailure.ErrType, upstreamFailure.Message)
 			s.logFailed(r.Context(), r, incomingModel, targetModel, stream,
-				status, msg, body, time.Since(start))
+				upstreamFailure.Status, upstreamFailure.Message, body, time.Since(start))
 			return
-		}
-
-		upURL := strings.TrimRight(upstream.BaseURL, "/") + "/v1/chat/completions"
-		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
-		if err != nil {
-			writeOpenAIError(w, http.StatusInternalServerError, "api_error",
-				"could not build upstream request: "+err.Error())
-			return
-		}
-		upReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
-		upReq.Header.Set("Content-Type", "application/json")
-		upReq.Header.Set("User-Agent", "opencode-cc/1.1")
-		if stream {
-			upReq.Header.Set("Accept", "text/event-stream")
-		} else {
-			upReq.Header.Set("Accept", "application/json")
-		}
-
-		httpClient := s.upstreamClient(stream, cfg.RequestTimeoutSeconds)
-		resp, err := httpClient.Do(upReq)
-		if err != nil {
-			if shouldCoolUpstreamError(err) {
-				s.cfg.ReportUpstreamResult(upstream, false, err.Error())
-			}
-			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
-			s.logFailed(r.Context(), r, incomingModel, targetModel, stream,
-				http.StatusBadGateway, err.Error(), body, time.Since(start))
-			return
-		}
-		if resp.StatusCode >= http.StatusBadRequest && shouldCoolUpstreamStatus(resp.StatusCode) {
-			s.cfg.ReportUpstreamResult(upstream, false, http.StatusText(resp.StatusCode))
-		} else if resp.StatusCode < http.StatusBadRequest {
-			s.cfg.ReportUpstreamResult(upstream, true, "")
 		}
 
 		contentType := strings.ToLower(resp.Header.Get("Content-Type"))

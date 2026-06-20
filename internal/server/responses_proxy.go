@@ -41,17 +41,8 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 		incomingModel := in.Model
 		targetModel := s.cfg.ResolveModel(incomingModel)
 		cfg := s.cfg.Snapshot()
-		upstream, ok := s.cfg.NextUpstream()
-		if !ok {
-			status, errType, msg := s.noUpstreamError()
-			writeOpenAIError(w, status, errType, msg)
-			s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
-				status, msg, body, time.Since(start))
-			return
-		}
-
 		if cfg.NativeAnthropic && proxy.IsNativeAnthropicModel(targetModel) {
-			s.proxyResponsesViaAnthropic(w, r, in, cfg, upstream, incomingModel, targetModel, body, start)
+			s.proxyResponsesViaAnthropic(w, r, in, cfg, incomingModel, targetModel, body, start)
 			return
 		}
 
@@ -69,37 +60,32 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 			return
 		}
 
-		upURL := strings.TrimRight(upstream.BaseURL, "/") + "/v1/chat/completions"
-		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
-		if err != nil {
-			writeOpenAIError(w, http.StatusInternalServerError, "api_error",
-				"could not build upstream request: "+err.Error())
-			return
-		}
-		upReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
-		upReq.Header.Set("Content-Type", "application/json")
-		upReq.Header.Set("User-Agent", "opencode-cc/1.2")
-		if in.Stream {
-			upReq.Header.Set("Accept", "text/event-stream")
-		} else {
-			upReq.Header.Set("Accept", "application/json")
-		}
-
-		httpClient := s.upstreamClient(in.Stream, cfg.RequestTimeoutSeconds)
-		resp, err := httpClient.Do(upReq)
-		if err != nil {
-			if shouldCoolUpstreamError(err) {
-				s.cfg.ReportUpstreamResult(upstream, false, err.Error())
-			}
-			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
+		resp, _, upstreamFailure := s.doUpstreamWithRetry(
+			r,
+			in.Stream,
+			cfg.RequestTimeoutSeconds,
+			func(upstream config.UpstreamSelection) (*http.Request, error) {
+				upURL := strings.TrimRight(upstream.BaseURL, "/") + "/v1/chat/completions"
+				upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
+				if err != nil {
+					return nil, err
+				}
+				upReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
+				upReq.Header.Set("Content-Type", "application/json")
+				upReq.Header.Set("User-Agent", "opencode-cc/1.2")
+				if in.Stream {
+					upReq.Header.Set("Accept", "text/event-stream")
+				} else {
+					upReq.Header.Set("Accept", "application/json")
+				}
+				return upReq, nil
+			},
+		)
+		if upstreamFailure != nil {
+			writeOpenAIError(w, upstreamFailure.Status, upstreamFailure.ErrType, upstreamFailure.Message)
 			s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
-				http.StatusBadGateway, err.Error(), body, time.Since(start))
+				upstreamFailure.Status, upstreamFailure.Message, body, time.Since(start))
 			return
-		}
-		if resp.StatusCode >= http.StatusBadRequest && shouldCoolUpstreamStatus(resp.StatusCode) {
-			s.cfg.ReportUpstreamResult(upstream, false, http.StatusText(resp.StatusCode))
-		} else if resp.StatusCode < http.StatusBadRequest {
-			s.cfg.ReportUpstreamResult(upstream, true, "")
 		}
 
 		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
@@ -117,7 +103,6 @@ func (s *Server) proxyResponsesViaAnthropic(
 	r *http.Request,
 	in *proxy.ResponsesRequest,
 	cfg *config.Config,
-	upstream config.UpstreamSelection,
 	incomingModel, targetModel string,
 	reqBody []byte,
 	start time.Time,
@@ -140,46 +125,41 @@ func (s *Server) proxyResponsesViaAnthropic(
 		return
 	}
 
-	upURL := strings.TrimRight(upstream.BaseURL, "/") + "/v1/messages"
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
-	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error",
-			"could not build upstream request: "+err.Error())
-		return
-	}
-	upReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
-	upReq.Header.Set("x-api-key", upstream.APIKey)
-	upReq.Header.Set("Content-Type", "application/json")
-	upReq.Header.Set("User-Agent", "opencode-cc/1.3")
-	if in.Stream {
-		upReq.Header.Set("Accept", "text/event-stream")
-	} else {
-		upReq.Header.Set("Accept", "application/json")
-	}
-	if version := r.Header.Get("anthropic-version"); version != "" {
-		upReq.Header.Set("anthropic-version", version)
-	} else {
-		upReq.Header.Set("anthropic-version", "2023-06-01")
-	}
-	if beta := r.Header.Get("anthropic-beta"); beta != "" {
-		upReq.Header.Set("anthropic-beta", beta)
-	}
-
-	httpClient := s.upstreamClient(in.Stream, cfg.RequestTimeoutSeconds)
-	resp, err := httpClient.Do(upReq)
-	if err != nil {
-		if shouldCoolUpstreamError(err) {
-			s.cfg.ReportUpstreamResult(upstream, false, err.Error())
-		}
-		writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
+	resp, _, upstreamFailure := s.doUpstreamWithRetry(
+		r,
+		in.Stream,
+		cfg.RequestTimeoutSeconds,
+		func(upstream config.UpstreamSelection) (*http.Request, error) {
+			upURL := strings.TrimRight(upstream.BaseURL, "/") + "/v1/messages"
+			upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
+			if err != nil {
+				return nil, err
+			}
+			upReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
+			upReq.Header.Set("x-api-key", upstream.APIKey)
+			upReq.Header.Set("Content-Type", "application/json")
+			upReq.Header.Set("User-Agent", "opencode-cc/1.3")
+			if in.Stream {
+				upReq.Header.Set("Accept", "text/event-stream")
+			} else {
+				upReq.Header.Set("Accept", "application/json")
+			}
+			if version := r.Header.Get("anthropic-version"); version != "" {
+				upReq.Header.Set("anthropic-version", version)
+			} else {
+				upReq.Header.Set("anthropic-version", "2023-06-01")
+			}
+			if beta := r.Header.Get("anthropic-beta"); beta != "" {
+				upReq.Header.Set("anthropic-beta", beta)
+			}
+			return upReq, nil
+		},
+	)
+	if upstreamFailure != nil {
+		writeOpenAIError(w, upstreamFailure.Status, upstreamFailure.ErrType, upstreamFailure.Message)
 		s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
-			http.StatusBadGateway, err.Error(), reqBody, time.Since(start))
+			upstreamFailure.Status, upstreamFailure.Message, reqBody, time.Since(start))
 		return
-	}
-	if resp.StatusCode >= http.StatusBadRequest && shouldCoolUpstreamStatus(resp.StatusCode) {
-		s.cfg.ReportUpstreamResult(upstream, false, http.StatusText(resp.StatusCode))
-	} else if resp.StatusCode < http.StatusBadRequest {
-		s.cfg.ReportUpstreamResult(upstream, true, "")
 	}
 
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))

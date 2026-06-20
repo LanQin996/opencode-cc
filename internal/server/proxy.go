@@ -42,17 +42,8 @@ func (s *Server) Proxy() http.HandlerFunc {
 		timeoutSeconds := cfg.RequestTimeoutSeconds
 		targetModel := s.cfg.ResolveModel(areq.Model)
 
-		// Pick the next upstream from the round-robin pool.
-		upstream, ok := s.cfg.NextUpstream()
-		if !ok {
-			status, errType, msg := s.noUpstreamError()
-			writeAnthropicError(w, status, errType, msg)
-			s.logFailed(ctx, r, areq.Model, targetModel, areq.Stream, status, msg, body, time.Since(start))
-			return
-		}
-
 		if nativeAnthropic && proxy.IsNativeAnthropicModel(targetModel) {
-			s.proxyNativeAnthropic(w, r, body, &areq, upstream, targetModel, timeoutSeconds, start)
+			s.proxyNativeAnthropic(w, r, body, &areq, targetModel, timeoutSeconds, start)
 			return
 		}
 
@@ -67,52 +58,42 @@ func (s *Server) Proxy() http.HandlerFunc {
 			return
 		}
 
-		upURL := strings.TrimRight(upstream.BaseURL, "/") + "/v1/chat/completions"
-		upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upURL, bytes.NewReader(upBody))
-		if err != nil {
-			writeAnthropicError(w, http.StatusInternalServerError, "api_error", "could not build upstream request: "+err.Error())
+		resp, _, upstreamFailure := s.doUpstreamWithRetry(
+			r,
+			areq.Stream,
+			timeoutSeconds,
+			func(upstream config.UpstreamSelection) (*http.Request, error) {
+				upURL := strings.TrimRight(upstream.BaseURL, "/") + "/v1/chat/completions"
+				upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upURL, bytes.NewReader(upBody))
+				if err != nil {
+					return nil, err
+				}
+				upReq.Header.Set("Content-Type", "application/json")
+				upReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
+				// Match the Accept header to the request mode: Zen (and most OpenAI-
+				// compatible servers) gate SSE delivery on Accept: text/event-stream.
+				// Sending application/json on a stream:true request makes some upstreams
+				// refuse with "streaming not supported".
+				if areq.Stream {
+					upReq.Header.Set("Accept", "text/event-stream")
+				} else {
+					upReq.Header.Set("Accept", "application/json")
+				}
+				// Some upstreams prefer a UA.
+				upReq.Header.Set("User-Agent", "opencode-cc/1.0")
+				// Propagate the anthropic-version / anthropic-beta for observability
+				// on the upstream side (Zen ignores them for the OpenAI path).
+				if v := r.Header.Get("anthropic-version"); v != "" {
+					upReq.Header.Set("anthropic-version", v)
+				}
+				return upReq, nil
+			},
+		)
+		if upstreamFailure != nil {
+			writeAnthropicError(w, upstreamFailure.Status, upstreamFailure.ErrType, upstreamFailure.Message)
+			s.logFailed(ctx, r, areq.Model, targetModel, areq.Stream, upstreamFailure.Status, upstreamFailure.Message, body, time.Since(start))
 			return
 		}
-		upReq.Header.Set("Content-Type", "application/json")
-		upReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
-		// Match the Accept header to the request mode: Zen (and most OpenAI-
-		// compatible servers) gate SSE delivery on Accept: text/event-stream.
-		// Sending application/json on a stream:true request makes some upstreams
-		// refuse with "streaming not supported".
-		if areq.Stream {
-			upReq.Header.Set("Accept", "text/event-stream")
-		} else {
-			upReq.Header.Set("Accept", "application/json")
-		}
-		// Some upstreams prefer a UA.
-		upReq.Header.Set("User-Agent", "opencode-cc/1.0")
-		// Propagate the anthropic-version / anthropic-beta for observability
-		// on the upstream side (Zen ignores them for the OpenAI path).
-		if v := r.Header.Get("anthropic-version"); v != "" {
-			upReq.Header.Set("anthropic-version", v)
-		}
-
-		httpClient := s.upstreamClient(areq.Stream, timeoutSeconds)
-
-		resp, err := httpClient.Do(upReq)
-		if err != nil {
-			if shouldCoolUpstreamError(err) {
-				s.cfg.ReportUpstreamResult(upstream, false, err.Error())
-			}
-			writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
-			s.logFailed(ctx, r, areq.Model, targetModel, areq.Stream, http.StatusBadGateway, err.Error(), body, time.Since(start))
-			return
-		}
-
-		// Non-2xx: pass the upstream error back in Anthropic shape.
-		if resp.StatusCode >= 400 {
-			if shouldCoolUpstreamStatus(resp.StatusCode) {
-				s.cfg.ReportUpstreamResult(upstream, false, http.StatusText(resp.StatusCode))
-			}
-			s.passUpstreamError(w, resp, r, areq.Model, targetModel, body, start)
-			return
-		}
-		s.cfg.ReportUpstreamResult(upstream, true, "")
 
 		if areq.Stream {
 			s.handleStreamResponse(w, resp, r, areq.Model, targetModel, body, start)
@@ -127,7 +108,6 @@ func (s *Server) proxyNativeAnthropic(
 	r *http.Request,
 	body []byte,
 	areq *proxy.AnthropicRequest,
-	upstream config.UpstreamSelection,
 	targetModel string,
 	timeoutSeconds int,
 	start time.Time,
@@ -138,44 +118,40 @@ func (s *Server) proxyNativeAnthropic(
 		return
 	}
 
-	upURL := strings.TrimRight(upstream.BaseURL, "/") + "/v1/messages"
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
-	if err != nil {
-		writeAnthropicError(w, http.StatusInternalServerError, "api_error", "could not build upstream request: "+err.Error())
+	resp, _, upstreamFailure := s.doUpstreamWithRetry(
+		r,
+		areq.Stream,
+		timeoutSeconds,
+		func(upstream config.UpstreamSelection) (*http.Request, error) {
+			upURL := strings.TrimRight(upstream.BaseURL, "/") + "/v1/messages"
+			upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
+			if err != nil {
+				return nil, err
+			}
+			upReq.Header.Set("Content-Type", "application/json")
+			upReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
+			upReq.Header.Set("x-api-key", upstream.APIKey)
+			upReq.Header.Set("User-Agent", "opencode-cc/1.3")
+			if areq.Stream {
+				upReq.Header.Set("Accept", "text/event-stream")
+			} else {
+				upReq.Header.Set("Accept", "application/json")
+			}
+			if version := r.Header.Get("anthropic-version"); version != "" {
+				upReq.Header.Set("anthropic-version", version)
+			} else {
+				upReq.Header.Set("anthropic-version", "2023-06-01")
+			}
+			if beta := r.Header.Get("anthropic-beta"); beta != "" {
+				upReq.Header.Set("anthropic-beta", beta)
+			}
+			return upReq, nil
+		},
+	)
+	if upstreamFailure != nil {
+		writeAnthropicError(w, upstreamFailure.Status, upstreamFailure.ErrType, upstreamFailure.Message)
+		s.logFailed(r.Context(), r, areq.Model, targetModel, areq.Stream, upstreamFailure.Status, upstreamFailure.Message, body, time.Since(start))
 		return
-	}
-	upReq.Header.Set("Content-Type", "application/json")
-	upReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
-	upReq.Header.Set("x-api-key", upstream.APIKey)
-	upReq.Header.Set("User-Agent", "opencode-cc/1.3")
-	if areq.Stream {
-		upReq.Header.Set("Accept", "text/event-stream")
-	} else {
-		upReq.Header.Set("Accept", "application/json")
-	}
-	if version := r.Header.Get("anthropic-version"); version != "" {
-		upReq.Header.Set("anthropic-version", version)
-	} else {
-		upReq.Header.Set("anthropic-version", "2023-06-01")
-	}
-	if beta := r.Header.Get("anthropic-beta"); beta != "" {
-		upReq.Header.Set("anthropic-beta", beta)
-	}
-
-	httpClient := s.upstreamClient(areq.Stream, timeoutSeconds)
-	resp, err := httpClient.Do(upReq)
-	if err != nil {
-		if shouldCoolUpstreamError(err) {
-			s.cfg.ReportUpstreamResult(upstream, false, err.Error())
-		}
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
-		s.logFailed(r.Context(), r, areq.Model, targetModel, areq.Stream, http.StatusBadGateway, err.Error(), body, time.Since(start))
-		return
-	}
-	if resp.StatusCode >= http.StatusBadRequest && shouldCoolUpstreamStatus(resp.StatusCode) {
-		s.cfg.ReportUpstreamResult(upstream, false, http.StatusText(resp.StatusCode))
-	} else if resp.StatusCode < http.StatusBadRequest {
-		s.cfg.ReportUpstreamResult(upstream, true, "")
 	}
 
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
