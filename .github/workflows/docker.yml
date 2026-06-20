@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Image tag to publish, for example 1.2.9"
+        description: "Image tag to publish, for example 1.2.8"
         required: true
         type: string
 
