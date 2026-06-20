@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Default values used when nothing else is configured.
@@ -25,6 +26,9 @@ const (
 	DefaultDataDir               = "data"
 	DefaultConfigFile            = "config.json"
 	DefaultOpenCodeGoWorkspaceID = "Default"
+
+	upstreamCooldownBase = 30 * time.Second
+	upstreamCooldownMax  = 5 * time.Minute
 )
 
 // ModelMapping maps an incoming Anthropic model name (often "claude-*") to the
@@ -51,6 +55,21 @@ type Upstream struct {
 	OpenCodeGoShowRolling *bool  `json:"opencode_go_show_rolling,omitempty"`
 	OpenCodeGoShowWeekly  *bool  `json:"opencode_go_show_weekly,omitempty"`
 	OpenCodeGoShowMonthly *bool  `json:"opencode_go_show_monthly,omitempty"`
+}
+
+// UpstreamSelection is the concrete upstream picked for one proxy request.
+// It is reported back to the config after the attempt so temporary failures can
+// cool down without disabling the account permanently.
+type UpstreamSelection struct {
+	ID      string
+	BaseURL string
+	APIKey  string
+}
+
+type upstreamHealth struct {
+	Failures      int
+	CooldownUntil time.Time
+	Reason        string
 }
 
 // ThinkingBudgetMapping maps Anthropic extended-thinking budgets to model-
@@ -122,6 +141,9 @@ type Config struct {
 	configPath string
 	mu         sync.RWMutex
 	rr         uint64 // round-robin cursor for NextUpstream (atomic)
+
+	healthMu sync.Mutex
+	health   map[string]upstreamHealth
 }
 
 // Patch represents a partial update from the control panel. Pointer fields
@@ -243,7 +265,12 @@ func (c *Config) migrateLegacyUpstream() {
 // Upstreams pool is empty it falls back to the legacy single fields. ok is false
 // when no usable upstream is configured (the caller should respond with an
 // "upstream not configured" error).
-func (c *Config) NextUpstream() (base, key string, ok bool) {
+//
+// Temporarily cooled-down upstreams are skipped. If all candidates are cooling
+// down, ok is false so callers can fail locally instead of repeatedly hammering
+// an unavailable upstream. Once the cooldown expires, the upstream naturally
+// becomes eligible again.
+func (c *Config) NextUpstream() (UpstreamSelection, bool) {
 	c.mu.RLock()
 	// Snapshot the enabled pool under the read lock.
 	pool := make([]Upstream, 0, len(c.Upstreams))
@@ -257,9 +284,21 @@ func (c *Config) NextUpstream() (base, key string, ok bool) {
 
 	if len(pool) == 0 {
 		if legacyBase != "" && legacyKey != "" {
-			return strings.TrimRight(legacyBase, "/"), legacyKey, true
+			sel := UpstreamSelection{
+				ID:      legacyUpstreamID(legacyBase, legacyKey),
+				BaseURL: strings.TrimRight(legacyBase, "/"),
+				APIKey:  legacyKey,
+			}
+			if c.selectionCooling(sel, time.Now()) {
+				return UpstreamSelection{}, false
+			}
+			return sel, true
 		}
-		return "", "", false
+		return UpstreamSelection{}, false
+	}
+	pool = c.filterCoolingUpstreams(pool, time.Now())
+	if len(pool) == 0 {
+		return UpstreamSelection{}, false
 	}
 	// Atomic round-robin: advance the cursor and pick modulo the pool size.
 	// AddUint64 returns the new value; subtract 1 so a fresh config starts at
@@ -267,7 +306,85 @@ func (c *Config) NextUpstream() (base, key string, ok bool) {
 	n := uint64(len(pool))
 	idx := (atomic.AddUint64(&c.rr, 1) - 1) % n
 	u := pool[idx]
-	return strings.TrimRight(u.BaseURL, "/"), u.APIKey, true
+	return UpstreamSelection{ID: upstreamRuntimeID(u), BaseURL: strings.TrimRight(u.BaseURL, "/"), APIKey: u.APIKey}, true
+}
+
+// HasConfiguredUpstream reports whether at least one enabled upstream with a
+// key exists, ignoring temporary cooldown state.
+func (c *Config) HasConfiguredUpstream() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, u := range c.Upstreams {
+		if u.Enabled && u.APIKey != "" {
+			return true
+		}
+	}
+	return c.UpstreamBase != "" && c.ZenAPIKey != ""
+}
+
+func (c *Config) filterCoolingUpstreams(pool []Upstream, now time.Time) []Upstream {
+	c.healthMu.Lock()
+	defer c.healthMu.Unlock()
+
+	active := make([]Upstream, 0, len(pool))
+	for _, u := range pool {
+		id := upstreamRuntimeID(u)
+		st, cooling := c.health[id]
+		if !cooling || st.CooldownUntil.IsZero() || !now.Before(st.CooldownUntil) {
+			active = append(active, u)
+			continue
+		}
+	}
+	return active
+}
+
+func (c *Config) selectionCooling(sel UpstreamSelection, now time.Time) bool {
+	c.healthMu.Lock()
+	defer c.healthMu.Unlock()
+	st, ok := c.health[sel.ID]
+	return ok && !st.CooldownUntil.IsZero() && now.Before(st.CooldownUntil)
+}
+
+// ReportUpstreamResult updates the temporary health state for one selected
+// upstream. Success clears cooldown. Failures use exponential cooldown:
+// 30s, 1m, 2m, 4m, capped at 5m.
+func (c *Config) ReportUpstreamResult(sel UpstreamSelection, success bool, reason string) {
+	id := strings.TrimSpace(sel.ID)
+	if id == "" {
+		id = legacyUpstreamID(sel.BaseURL, sel.APIKey)
+	}
+	if id == "" {
+		return
+	}
+
+	c.healthMu.Lock()
+	defer c.healthMu.Unlock()
+	if success {
+		delete(c.health, id)
+		return
+	}
+	if c.health == nil {
+		c.health = make(map[string]upstreamHealth)
+	}
+	st := c.health[id]
+	st.Failures++
+	delay := upstreamCooldownBase
+	for i := 1; i < st.Failures; i++ {
+		delay *= 2
+		if delay >= upstreamCooldownMax {
+			delay = upstreamCooldownMax
+			break
+		}
+	}
+	st.CooldownUntil = time.Now().Add(delay)
+	st.Reason = strings.TrimSpace(reason)
+	c.health[id] = st
+}
+
+func (c *Config) resetUpstreamHealthLocked() {
+	c.healthMu.Lock()
+	defer c.healthMu.Unlock()
+	c.health = nil
 }
 
 // applyEnv overlays environment variables on top of the loaded config.
@@ -536,6 +653,7 @@ func (c *Config) ApplyPatch(src *Patch) {
 		}
 		c.Upstreams = cloneUpstreams(next)
 		atomic.StoreUint64(&c.rr, 0)
+		c.resetUpstreamHealthLocked()
 	}
 	if src.PanelToken != nil {
 		c.PanelToken = *src.PanelToken
@@ -604,6 +722,29 @@ func normalizeUpstream(u *Upstream) {
 	}
 	u.BaseURL = strings.TrimRight(u.BaseURL, "/")
 	u.OpenCodeGoWorkspaceID = defaultOpenCodeGoWorkspaceID(u.OpenCodeGoWorkspaceID)
+}
+
+func upstreamRuntimeID(u Upstream) string {
+	if id := strings.TrimSpace(u.ID); id != "" {
+		return id
+	}
+	return legacyUpstreamID(u.BaseURL, u.APIKey)
+}
+
+func legacyUpstreamID(base, key string) string {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if base == "" || strings.TrimSpace(key) == "" {
+		return ""
+	}
+	return "legacy:" + base + ":" + maskKeyForID(key)
+}
+
+func maskKeyForID(key string) string {
+	key = strings.TrimSpace(key)
+	if len(key) <= 8 {
+		return key
+	}
+	return key[:4] + ":" + key[len(key)-4:]
 }
 
 var upstreamIDFallback uint64

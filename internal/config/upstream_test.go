@@ -18,10 +18,11 @@ func TestNextUpstreamRoundRobin(t *testing.T) {
 	var order []string
 	seen := map[string]int{}
 	for i := 0; i < 6; i++ {
-		base, key, ok := c.NextUpstream()
+		upstream, ok := c.NextUpstream()
 		if !ok {
 			t.Fatalf("request %d: expected ok", i)
 		}
+		base, key := upstream.BaseURL, upstream.APIKey
 		seen[base]++
 		// key must match the base
 		want := "ka"
@@ -67,10 +68,11 @@ func TestNextUpstreamLegacyFallback(t *testing.T) {
 	c.UpstreamBase = "https://legacy.example/"
 	c.ZenAPIKey = "legacy-key"
 
-	base, key, ok := c.NextUpstream()
+	upstream, ok := c.NextUpstream()
 	if !ok {
 		t.Fatalf("expected ok via legacy fallback")
 	}
+	base, key := upstream.BaseURL, upstream.APIKey
 	if base != "https://legacy.example" {
 		t.Errorf("base = %q, want https://legacy.example (trailing slash trimmed)", base)
 	}
@@ -85,8 +87,67 @@ func TestNextUpstreamNoneConfigured(t *testing.T) {
 	c.Upstreams = nil
 	c.UpstreamBase = ""
 	c.ZenAPIKey = ""
-	if _, _, ok := c.NextUpstream(); ok {
+	if _, ok := c.NextUpstream(); ok {
 		t.Errorf("expected ok=false with no upstream configured")
+	}
+}
+
+func TestNextUpstreamSkipsCoolingUpstream(t *testing.T) {
+	c := Default()
+	c.Upstreams = []Upstream{
+		{ID: "up_a", BaseURL: "https://a.example", APIKey: "ka", Enabled: true},
+		{ID: "up_b", BaseURL: "https://b.example", APIKey: "kb", Enabled: true},
+	}
+
+	first, ok := c.NextUpstream()
+	if !ok || first.ID != "up_a" {
+		t.Fatalf("first upstream = %+v ok=%v, want up_a", first, ok)
+	}
+	c.ReportUpstreamResult(first, false, "rate limited")
+
+	for i := 0; i < 3; i++ {
+		next, ok := c.NextUpstream()
+		if !ok {
+			t.Fatalf("next %d: expected ok", i)
+		}
+		if next.ID != "up_b" {
+			t.Fatalf("cooling upstream selected: got %+v, want up_b", next)
+		}
+	}
+
+	c.ReportUpstreamResult(first, true, "")
+	next, ok := c.NextUpstream()
+	if !ok {
+		t.Fatalf("expected ok after reset")
+	}
+	if next.ID != "up_a" {
+		t.Fatalf("success did not clear cooldown, got %+v", next)
+	}
+}
+
+func TestNextUpstreamReturnsFalseWhenAllUpstreamsCooling(t *testing.T) {
+	c := Default()
+	c.Upstreams = []Upstream{
+		{ID: "up_a", BaseURL: "https://a.example", APIKey: "ka", Enabled: true},
+		{ID: "up_b", BaseURL: "https://b.example", APIKey: "kb", Enabled: true},
+	}
+
+	a, ok := c.NextUpstream()
+	if !ok {
+		t.Fatal("expected first upstream")
+	}
+	b, ok := c.NextUpstream()
+	if !ok {
+		t.Fatal("expected second upstream")
+	}
+	c.ReportUpstreamResult(a, false, "bad gateway")
+	c.ReportUpstreamResult(b, false, "bad gateway")
+
+	if _, ok := c.NextUpstream(); ok {
+		t.Fatal("expected ok=false while all upstreams are cooling")
+	}
+	if !c.HasConfiguredUpstream() {
+		t.Fatal("configured upstreams should still be visible while cooling")
 	}
 }
 

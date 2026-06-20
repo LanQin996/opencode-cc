@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kiowx/opencode-cc/internal/config"
 	"github.com/Kiowx/opencode-cc/internal/proxy"
 	"github.com/Kiowx/opencode-cc/internal/store"
 )
@@ -42,15 +43,16 @@ func (s *Server) Proxy() http.HandlerFunc {
 		targetModel := s.cfg.ResolveModel(areq.Model)
 
 		// Pick the next upstream from the round-robin pool.
-		upstream, zenKey, ok := s.cfg.NextUpstream()
+		upstream, ok := s.cfg.NextUpstream()
 		if !ok {
-			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "no upstream API key configured. Set one in the web panel (Settings → upstreams).")
-			s.logFailed(ctx, r, areq.Model, targetModel, areq.Stream, http.StatusUnauthorized, "no upstream api key", body, time.Since(start))
+			status, errType, msg := s.noUpstreamError()
+			writeAnthropicError(w, status, errType, msg)
+			s.logFailed(ctx, r, areq.Model, targetModel, areq.Stream, status, msg, body, time.Since(start))
 			return
 		}
 
 		if nativeAnthropic && proxy.IsNativeAnthropicModel(targetModel) {
-			s.proxyNativeAnthropic(w, r, body, &areq, upstream, zenKey, targetModel, timeoutSeconds, start)
+			s.proxyNativeAnthropic(w, r, body, &areq, upstream, targetModel, timeoutSeconds, start)
 			return
 		}
 
@@ -65,14 +67,14 @@ func (s *Server) Proxy() http.HandlerFunc {
 			return
 		}
 
-		upURL := strings.TrimRight(upstream, "/") + "/v1/chat/completions"
+		upURL := strings.TrimRight(upstream.BaseURL, "/") + "/v1/chat/completions"
 		upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upURL, bytes.NewReader(upBody))
 		if err != nil {
 			writeAnthropicError(w, http.StatusInternalServerError, "api_error", "could not build upstream request: "+err.Error())
 			return
 		}
 		upReq.Header.Set("Content-Type", "application/json")
-		upReq.Header.Set("Authorization", "Bearer "+zenKey)
+		upReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
 		// Match the Accept header to the request mode: Zen (and most OpenAI-
 		// compatible servers) gate SSE delivery on Accept: text/event-stream.
 		// Sending application/json on a stream:true request makes some upstreams
@@ -94,6 +96,9 @@ func (s *Server) Proxy() http.HandlerFunc {
 
 		resp, err := httpClient.Do(upReq)
 		if err != nil {
+			if shouldCoolUpstreamError(err) {
+				s.cfg.ReportUpstreamResult(upstream, false, err.Error())
+			}
 			writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
 			s.logFailed(ctx, r, areq.Model, targetModel, areq.Stream, http.StatusBadGateway, err.Error(), body, time.Since(start))
 			return
@@ -101,9 +106,13 @@ func (s *Server) Proxy() http.HandlerFunc {
 
 		// Non-2xx: pass the upstream error back in Anthropic shape.
 		if resp.StatusCode >= 400 {
+			if shouldCoolUpstreamStatus(resp.StatusCode) {
+				s.cfg.ReportUpstreamResult(upstream, false, http.StatusText(resp.StatusCode))
+			}
 			s.passUpstreamError(w, resp, r, areq.Model, targetModel, body, start)
 			return
 		}
+		s.cfg.ReportUpstreamResult(upstream, true, "")
 
 		if areq.Stream {
 			s.handleStreamResponse(w, resp, r, areq.Model, targetModel, body, start)
@@ -118,7 +127,8 @@ func (s *Server) proxyNativeAnthropic(
 	r *http.Request,
 	body []byte,
 	areq *proxy.AnthropicRequest,
-	upstream, zenKey, targetModel string,
+	upstream config.UpstreamSelection,
+	targetModel string,
 	timeoutSeconds int,
 	start time.Time,
 ) {
@@ -128,15 +138,15 @@ func (s *Server) proxyNativeAnthropic(
 		return
 	}
 
-	upURL := strings.TrimRight(upstream, "/") + "/v1/messages"
+	upURL := strings.TrimRight(upstream.BaseURL, "/") + "/v1/messages"
 	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
 	if err != nil {
 		writeAnthropicError(w, http.StatusInternalServerError, "api_error", "could not build upstream request: "+err.Error())
 		return
 	}
 	upReq.Header.Set("Content-Type", "application/json")
-	upReq.Header.Set("Authorization", "Bearer "+zenKey)
-	upReq.Header.Set("x-api-key", zenKey)
+	upReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
+	upReq.Header.Set("x-api-key", upstream.APIKey)
 	upReq.Header.Set("User-Agent", "opencode-cc/1.3")
 	if areq.Stream {
 		upReq.Header.Set("Accept", "text/event-stream")
@@ -155,9 +165,17 @@ func (s *Server) proxyNativeAnthropic(
 	httpClient := s.upstreamClient(areq.Stream, timeoutSeconds)
 	resp, err := httpClient.Do(upReq)
 	if err != nil {
+		if shouldCoolUpstreamError(err) {
+			s.cfg.ReportUpstreamResult(upstream, false, err.Error())
+		}
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
 		s.logFailed(r.Context(), r, areq.Model, targetModel, areq.Stream, http.StatusBadGateway, err.Error(), body, time.Since(start))
 		return
+	}
+	if resp.StatusCode >= http.StatusBadRequest && shouldCoolUpstreamStatus(resp.StatusCode) {
+		s.cfg.ReportUpstreamResult(upstream, false, http.StatusText(resp.StatusCode))
+	} else if resp.StatusCode < http.StatusBadRequest {
+		s.cfg.ReportUpstreamResult(upstream, true, "")
 	}
 
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))

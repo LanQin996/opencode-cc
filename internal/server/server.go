@@ -53,8 +53,8 @@ func (s *Server) Handler(panelAssets http.FileSystem, panelMux http.Handler) htt
 	mux.Handle("/v1/models", s.clientAuth(proxy.ModelsHandlerWithUpstream(
 		s.httpClient,
 		func() (string, string) {
-			base, key, _ := s.cfg.NextUpstream()
-			return base, key
+			upstream, _ := s.cfg.NextUpstream()
+			return upstream.BaseURL, upstream.APIKey
 		},
 	)))
 

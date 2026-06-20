@@ -39,23 +39,23 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 		}
 
 		cfg := s.cfg.Snapshot()
-		upstream, zenKey, ok := s.cfg.NextUpstream()
+		upstream, ok := s.cfg.NextUpstream()
 		if !ok {
-			const msg = "no upstream API key configured. Set one in the web panel (Settings → upstreams)."
-			writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", msg)
+			status, errType, msg := s.noUpstreamError()
+			writeOpenAIError(w, status, errType, msg)
 			s.logFailed(r.Context(), r, incomingModel, targetModel, stream,
-				http.StatusUnauthorized, "no upstream api key", body, time.Since(start))
+				status, msg, body, time.Since(start))
 			return
 		}
 
-		upURL := strings.TrimRight(upstream, "/") + "/v1/chat/completions"
+		upURL := strings.TrimRight(upstream.BaseURL, "/") + "/v1/chat/completions"
 		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
 		if err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, "api_error",
 				"could not build upstream request: "+err.Error())
 			return
 		}
-		upReq.Header.Set("Authorization", "Bearer "+zenKey)
+		upReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
 		upReq.Header.Set("Content-Type", "application/json")
 		upReq.Header.Set("User-Agent", "opencode-cc/1.1")
 		if stream {
@@ -67,10 +67,18 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 		httpClient := s.upstreamClient(stream, cfg.RequestTimeoutSeconds)
 		resp, err := httpClient.Do(upReq)
 		if err != nil {
+			if shouldCoolUpstreamError(err) {
+				s.cfg.ReportUpstreamResult(upstream, false, err.Error())
+			}
 			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
 			s.logFailed(r.Context(), r, incomingModel, targetModel, stream,
 				http.StatusBadGateway, err.Error(), body, time.Since(start))
 			return
+		}
+		if resp.StatusCode >= http.StatusBadRequest && shouldCoolUpstreamStatus(resp.StatusCode) {
+			s.cfg.ReportUpstreamResult(upstream, false, http.StatusText(resp.StatusCode))
+		} else if resp.StatusCode < http.StatusBadRequest {
+			s.cfg.ReportUpstreamResult(upstream, true, "")
 		}
 
 		contentType := strings.ToLower(resp.Header.Get("Content-Type"))

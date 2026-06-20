@@ -83,6 +83,66 @@ func TestRoundRobinUpstreamsAcrossRequests(t *testing.T) {
 	}
 }
 
+func TestFailedUpstreamCoolsDownAndIsSkipped(t *testing.T) {
+	var mu sync.Mutex
+	hitsA, hitsB := 0, 0
+	zenA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hitsA++
+		mu.Unlock()
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"message":"temporary failure"}}`)
+	}))
+	defer zenA.Close()
+	zenB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hitsB++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "b", "choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "ok"}, "finish_reason": "stop"}},
+			"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+		})
+	}))
+	defer zenB.Close()
+
+	cfg := config.Default()
+	cfg.Upstreams = []config.Upstream{
+		{ID: "up_a", BaseURL: zenA.URL, APIKey: "key-A", Enabled: true},
+		{ID: "up_b", BaseURL: zenB.URL, APIKey: "key-B", Enabled: true},
+	}
+	cfg.ModelMappings = []config.ModelMapping{{Match: "*", Target: "glm-5.1"}}
+	srv, _ := newTestServerWithCfg(t, cfg)
+
+	body, _ := json.Marshal(map[string]any{
+		"model": "claude-x", "max_tokens": 8,
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+
+	first := httptest.NewRecorder()
+	srv.Proxy()(first, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body))))
+	if first.Code != http.StatusInternalServerError {
+		t.Fatalf("first status = %d body=%s, want upstream error", first.Code, first.Body.String())
+	}
+
+	for i := 0; i < 3; i++ {
+		rr := httptest.NewRecorder()
+		srv.Proxy()(rr, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body))))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("retry %d status = %d body=%s", i, rr.Code, rr.Body.String())
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if hitsA != 1 {
+		t.Fatalf("cooled upstream A was hit %d times, want 1", hitsA)
+	}
+	if hitsB != 3 {
+		t.Fatalf("healthy upstream B hits = %d, want 3", hitsB)
+	}
+}
+
 func TestModelsEndpointUsesPairedRoundRobinUpstream(t *testing.T) {
 	zenA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer key-A" {
