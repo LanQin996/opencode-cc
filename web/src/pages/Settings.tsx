@@ -6,6 +6,7 @@ import { Badge, Card, Spinner } from "../components/ui";
 // One editable upstream row. api_key is the local edit buffer (empty = keep
 // existing, matches the backend "empty = don't change" sentinel).
 interface UpstreamRow {
+  id?: string;
   base_url: string;
   api_key: string;
   name: string;
@@ -63,6 +64,7 @@ export default function Settings() {
       setPromptCacheNormalize(c.prompt_cache_normalize);
       // Seed the upstreams editor from the server view.
       const rows: UpstreamRow[] = (c.upstreams && c.upstreams.length ? c.upstreams : []).map((u) => ({
+        id: u.id,
         base_url: u.base_url,
         api_key: "",
         name: u.name,
@@ -116,6 +118,7 @@ export default function Settings() {
         prompt_cache_anthropic_control: promptCacheAnthropicControl,
         prompt_cache_normalize: promptCacheNormalize,
         upstreams: upstreams.map((u) => ({
+          id: u.id,
           base_url: u.base_url,
           // empty api_key = keep existing (backend sentinel); only send typed value
           api_key: u.api_key.trim(),
@@ -135,6 +138,7 @@ export default function Settings() {
       if (updated.upstreams) {
         setUpstreams(
           updated.upstreams.map((u) => ({
+            id: u.id,
             base_url: u.base_url,
             api_key: "",
             name: u.name,

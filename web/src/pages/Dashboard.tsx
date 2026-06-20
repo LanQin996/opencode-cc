@@ -176,7 +176,7 @@ export default function Dashboard() {
 
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
             {goQuota.map((account) => (
-              <QuotaAccountCard key={`${account.index}-${account.base_url}`} account={account} />
+              <QuotaAccountCard key={account.id || `${account.index}-${account.base_url}`} account={account} />
             ))}
           </div>
         </Card>

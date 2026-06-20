@@ -287,6 +287,7 @@ func publicConfig(c *config.Config) map[string]any {
 	upstreamsView := make([]map[string]any, 0, len(c.Upstreams))
 	for _, u := range c.Upstreams {
 		upstreamsView = append(upstreamsView, map[string]any{
+			"id":                             u.ID,
 			"base_url":                       u.BaseURL,
 			"api_key_masked":                 maskKey(u.APIKey),
 			"api_key_set":                    u.APIKey != "",

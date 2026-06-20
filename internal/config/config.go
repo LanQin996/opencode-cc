@@ -6,6 +6,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -38,7 +40,8 @@ type ModelMapping struct {
 // Upstream is one backend (base URL + API key) the proxy can forward to.
 // Multiple upstreams form a pool that is round-robined per request.
 type Upstream struct {
-	BaseURL string `json:"base_url"` // e.g. https://opencode.ai/zen/go or https://opencode.ai/zen/
+	ID      string `json:"id,omitempty"` // stable row id used to preserve secrets across reorder/delete
+	BaseURL string `json:"base_url"`     // e.g. https://opencode.ai/zen/go or https://opencode.ai/zen/
 	APIKey  string `json:"api_key"`
 	Name    string `json:"name"`    // optional human label
 	Enabled bool   `json:"enabled"` // skip when false
@@ -208,6 +211,7 @@ func Load(dataDir string) (*Config, error) {
 
 	c.applyEnv()
 	c.migrateLegacyUpstream()
+	c.ensureUpstreamIDs()
 	return c, nil
 }
 
@@ -222,6 +226,7 @@ func (c *Config) migrateLegacyUpstream() {
 	}
 	if c.UpstreamBase != "" && c.ZenAPIKey != "" {
 		c.Upstreams = []Upstream{{
+			ID:                    newUpstreamID(),
 			BaseURL:               strings.TrimRight(c.UpstreamBase, "/"),
 			APIKey:                c.ZenAPIKey,
 			Enabled:               true,
@@ -257,10 +262,10 @@ func (c *Config) NextUpstream() (base, key string, ok bool) {
 		return "", "", false
 	}
 	// Atomic round-robin: advance the cursor and pick modulo the pool size.
-	// AddUint64 returns the new value; we use (old+1) % n to spread the first
-	// pick across callers.
+	// AddUint64 returns the new value; subtract 1 so a fresh config starts at
+	// the first enabled upstream in the configured order.
 	n := uint64(len(pool))
-	idx := atomic.AddUint64(&c.rr, 1) % n
+	idx := (atomic.AddUint64(&c.rr, 1) - 1) % n
 	u := pool[idx]
 	return strings.TrimRight(u.BaseURL, "/"), u.APIKey, true
 }
@@ -331,6 +336,7 @@ func (c *Config) Save() error {
 	if c.dataDir == "" {
 		return nil
 	}
+	c.ensureUpstreamIDsLocked()
 	if err := os.MkdirAll(c.dataDir, 0o755); err != nil {
 		return err
 	}
@@ -470,30 +476,66 @@ func (c *Config) ApplyPatch(src *Patch) {
 	// the "empty = keep existing key" sentinel so masked edits don't wipe keys.
 	if src.Upstreams != nil {
 		next := *src.Upstreams
-		// Preserve existing keys where the patch left them blank, matching by
-		// position (the panel sends the full ordered list back). OpenCode Go
-		// auth cookies use the same sentinel so masked edits don't wipe secrets.
+		// Preserve existing keys/cookies where the patch left them blank.
+		// Prefer the stable upstream ID so reordering/deleting rows never moves
+		// a secret to the wrong account. Position matching is kept only for
+		// legacy clients that send the unchanged full list without IDs.
 		prev := c.Upstreams
+		prevByID := make(map[string]Upstream, len(prev))
+		for _, u := range prev {
+			if id := strings.TrimSpace(u.ID); id != "" {
+				prevByID[id] = u
+			}
+		}
+		incomingHasIDs := false
+		for _, u := range next {
+			if strings.TrimSpace(u.ID) != "" {
+				incomingHasIDs = true
+				break
+			}
+		}
+		seenNextID := map[string]bool{}
 		for i := range next {
-			if next[i].APIKey == "" && i < len(prev) && prev[i].APIKey != "" {
-				next[i].APIKey = prev[i].APIKey
+			next[i].ID = strings.TrimSpace(next[i].ID)
+			if next[i].ID != "" {
+				if seenNextID[next[i].ID] {
+					// Duplicated IDs would duplicate secrets; treat the later
+					// row as new instead.
+					next[i].ID = ""
+				} else {
+					seenNextID[next[i].ID] = true
+				}
 			}
-			if next[i].OpenCodeGoAuthCookie == "" && i < len(prev) && prev[i].OpenCodeGoAuthCookie != "" {
-				next[i].OpenCodeGoAuthCookie = prev[i].OpenCodeGoAuthCookie
+			var old Upstream
+			matched := false
+			if next[i].ID != "" {
+				old, matched = prevByID[next[i].ID]
+			} else if !incomingHasIDs && len(next) == len(prev) && i < len(prev) {
+				old, matched = prev[i], true
+				next[i].ID = old.ID
 			}
-			if next[i].OpenCodeGoShowRolling == nil && i < len(prev) {
-				next[i].OpenCodeGoShowRolling = prev[i].OpenCodeGoShowRolling
+			if next[i].ID == "" {
+				next[i].ID = newUpstreamID()
 			}
-			if next[i].OpenCodeGoShowWeekly == nil && i < len(prev) {
-				next[i].OpenCodeGoShowWeekly = prev[i].OpenCodeGoShowWeekly
+			if matched && next[i].APIKey == "" && old.APIKey != "" {
+				next[i].APIKey = old.APIKey
 			}
-			if next[i].OpenCodeGoShowMonthly == nil && i < len(prev) {
-				next[i].OpenCodeGoShowMonthly = prev[i].OpenCodeGoShowMonthly
+			if matched && next[i].OpenCodeGoAuthCookie == "" && old.OpenCodeGoAuthCookie != "" {
+				next[i].OpenCodeGoAuthCookie = old.OpenCodeGoAuthCookie
 			}
-			next[i].BaseURL = strings.TrimRight(next[i].BaseURL, "/")
-			next[i].OpenCodeGoWorkspaceID = defaultOpenCodeGoWorkspaceID(next[i].OpenCodeGoWorkspaceID)
+			if matched && next[i].OpenCodeGoShowRolling == nil {
+				next[i].OpenCodeGoShowRolling = old.OpenCodeGoShowRolling
+			}
+			if matched && next[i].OpenCodeGoShowWeekly == nil {
+				next[i].OpenCodeGoShowWeekly = old.OpenCodeGoShowWeekly
+			}
+			if matched && next[i].OpenCodeGoShowMonthly == nil {
+				next[i].OpenCodeGoShowMonthly = old.OpenCodeGoShowMonthly
+			}
+			normalizeUpstream(&next[i])
 		}
 		c.Upstreams = cloneUpstreams(next)
+		atomic.StoreUint64(&c.rr, 0)
 	}
 	if src.PanelToken != nil {
 		c.PanelToken = *src.PanelToken
@@ -541,6 +583,38 @@ func defaultOpenCodeGoWorkspaceID(workspaceID string) string {
 		return DefaultOpenCodeGoWorkspaceID
 	}
 	return ws
+}
+
+func (c *Config) ensureUpstreamIDs() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureUpstreamIDsLocked()
+}
+
+func (c *Config) ensureUpstreamIDsLocked() {
+	for i := range c.Upstreams {
+		normalizeUpstream(&c.Upstreams[i])
+	}
+}
+
+func normalizeUpstream(u *Upstream) {
+	u.ID = strings.TrimSpace(u.ID)
+	if u.ID == "" {
+		u.ID = newUpstreamID()
+	}
+	u.BaseURL = strings.TrimRight(u.BaseURL, "/")
+	u.OpenCodeGoWorkspaceID = defaultOpenCodeGoWorkspaceID(u.OpenCodeGoWorkspaceID)
+}
+
+var upstreamIDFallback uint64
+
+func newUpstreamID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return "up_" + hex.EncodeToString(b[:])
+	}
+	// Extremely unlikely fallback; unique enough inside one process.
+	return "up_fallback_" + strconv.FormatUint(atomic.AddUint64(&upstreamIDFallback, 1), 36)
 }
 
 func cloneBoolPtr(v *bool) *bool {

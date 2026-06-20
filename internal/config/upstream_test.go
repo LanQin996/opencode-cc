@@ -15,6 +15,7 @@ func TestNextUpstreamRoundRobin(t *testing.T) {
 		{BaseURL: "https://d.example", APIKey: "", Enabled: true},    // empty key, skipped
 	}
 
+	var order []string
 	seen := map[string]int{}
 	for i := 0; i < 6; i++ {
 		base, key, ok := c.NextUpstream()
@@ -29,6 +30,20 @@ func TestNextUpstreamRoundRobin(t *testing.T) {
 		}
 		if key != want {
 			t.Errorf("base %s: got key %q want %q", base, key, want)
+		}
+		order = append(order, base)
+	}
+	wantOrder := []string{
+		"https://a.example",
+		"https://b.example",
+		"https://a.example",
+		"https://b.example",
+		"https://a.example",
+		"https://b.example",
+	}
+	for i := range wantOrder {
+		if order[i] != wantOrder[i] {
+			t.Fatalf("round-robin order = %v, want %v", order, wantOrder)
 		}
 	}
 	// 6 requests over 2 enabled upstreams → 3 each
@@ -154,6 +169,69 @@ func TestApplyPatchPreservesOpenCodeGoQuotaSecretsAndVisibility(t *testing.T) {
 		got.OpenCodeGoShowWeekly == nil || *got.OpenCodeGoShowWeekly != false ||
 		got.OpenCodeGoShowMonthly == nil || *got.OpenCodeGoShowMonthly != true {
 		t.Fatalf("OpenCode Go visibility flags were not preserved: %+v", got)
+	}
+}
+
+func TestApplyPatchPreservesUpstreamSecretsByIDAfterDeleteAndReorder(t *testing.T) {
+	c := Default()
+	c.Upstreams = []Upstream{
+		{ID: "up_a", BaseURL: "https://a.example", APIKey: "key-a", Enabled: true, OpenCodeGoAuthCookie: "auth=a"},
+		{ID: "up_b", BaseURL: "https://b.example", APIKey: "key-b", Enabled: true, OpenCodeGoAuthCookie: "auth=b"},
+		{ID: "up_c", BaseURL: "https://c.example", APIKey: "key-c", Enabled: true, OpenCodeGoAuthCookie: "auth=c"},
+	}
+
+	// Simulate the panel deleting A and reordering C before B. Blank secrets
+	// mean "keep existing"; they must be matched by stable ID, not by index.
+	next := []Upstream{
+		{ID: "up_c", BaseURL: "https://c-new.example/", APIKey: "", Enabled: true, OpenCodeGoAuthCookie: ""},
+		{ID: "up_b", BaseURL: "https://b-new.example/", APIKey: "", Enabled: true, OpenCodeGoAuthCookie: ""},
+	}
+	c.ApplyPatch(&Patch{Upstreams: &next})
+
+	got := c.Snapshot().Upstreams
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2: %+v", len(got), got)
+	}
+	if got[0].ID != "up_c" || got[0].APIKey != "key-c" || got[0].OpenCodeGoAuthCookie != "auth=c" {
+		t.Fatalf("first row secret mismatch after reorder/delete: %+v", got[0])
+	}
+	if got[1].ID != "up_b" || got[1].APIKey != "key-b" || got[1].OpenCodeGoAuthCookie != "auth=b" {
+		t.Fatalf("second row secret mismatch after reorder/delete: %+v", got[1])
+	}
+	for _, u := range got {
+		if u.ID == "up_a" || u.APIKey == "key-a" || u.OpenCodeGoAuthCookie == "auth=a" {
+			t.Fatalf("deleted upstream secret leaked into result: %+v", got)
+		}
+	}
+}
+
+func TestApplyPatchDoesNotPreserveDeletedSecretIntoNewIDLessRow(t *testing.T) {
+	c := Default()
+	c.Upstreams = []Upstream{
+		{ID: "up_a", BaseURL: "https://a.example", APIKey: "key-a", Enabled: true, OpenCodeGoAuthCookie: "auth=a"},
+		{ID: "up_b", BaseURL: "https://b.example", APIKey: "key-b", Enabled: true, OpenCodeGoAuthCookie: "auth=b"},
+	}
+
+	// Keep B by ID and add a new row without an ID. The new row must not
+	// inherit A's secret just because it occupies A's old index.
+	next := []Upstream{
+		{BaseURL: "https://new.example", APIKey: "", Enabled: true, OpenCodeGoAuthCookie: ""},
+		{ID: "up_b", BaseURL: "https://b-new.example", APIKey: "", Enabled: true, OpenCodeGoAuthCookie: ""},
+	}
+	c.ApplyPatch(&Patch{Upstreams: &next})
+
+	got := c.Snapshot().Upstreams
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2: %+v", len(got), got)
+	}
+	if got[0].ID == "" || got[0].ID == "up_a" || got[0].ID == "up_b" {
+		t.Fatalf("new row did not get a fresh ID: %+v", got[0])
+	}
+	if got[0].APIKey != "" || got[0].OpenCodeGoAuthCookie != "" {
+		t.Fatalf("new row inherited deleted secret: %+v", got[0])
+	}
+	if got[1].ID != "up_b" || got[1].APIKey != "key-b" || got[1].OpenCodeGoAuthCookie != "auth=b" {
+		t.Fatalf("kept row secret mismatch: %+v", got[1])
 	}
 }
 

@@ -54,6 +54,7 @@ type openCodeGoQuotaWindow struct {
 }
 
 type openCodeGoQuotaAccount struct {
+	ID        string                  `json:"id,omitempty"`
 	Index     int                     `json:"index"`
 	Name      string                  `json:"name"`
 	BaseURL   string                  `json:"base_url"`
@@ -93,6 +94,7 @@ func (a *API) opencodeGoQuota(w http.ResponseWriter, r *http.Request) {
 		workspaceID = openCodeGoWorkspaceOrDefault(workspaceID)
 
 		account := openCodeGoQuotaAccount{
+			ID:        up.ID,
 			Index:     i,
 			Name:      up.Name,
 			BaseURL:   up.BaseURL,

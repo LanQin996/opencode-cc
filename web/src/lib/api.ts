@@ -55,6 +55,7 @@ export interface LogRow {
 }
 
 export interface UpstreamView {
+  id?: string;
   base_url: string;
   api_key_masked: string;
   api_key_set: boolean;
@@ -164,6 +165,7 @@ export interface OpenCodeGoQuotaWindow {
 }
 
 export interface OpenCodeGoQuotaAccount {
+  id?: string;
   index: number;
   name: string;
   base_url: string;
